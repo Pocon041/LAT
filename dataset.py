@@ -18,35 +18,48 @@ def _collect_images(folder, exts=(".png", ".jpg", ".jpeg")):
     return paths
 
 
+def _resize_shorter_side(img, target_short=288):
+    """将图像短边 resize 到 target_short, 保持长宽比"""
+    w, h = img.size
+    short_side = min(w, h)
+    if short_side != target_short:
+        scale = target_short / short_side
+        img = img.resize((int(w * scale), int(h * scale)), Image.BICUBIC)
+    return img
+
+
 class RealPatchDataset(Dataset):
     """
-    DIV2K + Flickr2K 真实图像数据集, 随机裁剪 256x256 patch
-    由于原图分辨率远大于 256, 每张图每 epoch 可裁多个 patch
+    DIV2K + Flickr2K 真实图像数据集
+    train: 随机裁剪 256x256 + 随机翻转
+    val: Resize(shorter_side=288) + CenterCrop(256), 完全确定性
     """
     def __init__(self, patches_per_image=8, split="train"):
         super().__init__()
-        self.patches_per_image = patches_per_image
+        self.is_train = (split == "train")
 
         if split == "train":
             self.paths = (
                 _collect_images(config.DIV2K_TRAIN_DIR)
                 + _collect_images(config.FLICKR2K_DIR)
             )
+            self.patches_per_image = patches_per_image
         else:
             self.paths = _collect_images(config.DIV2K_VAL_DIR)
+            self.patches_per_image = 1  # val 每张图只出一个确定性 patch
 
-        # 随机裁剪 + 数据增强
-        self.crop = transforms.RandomCrop(config.IMG_SIZE)
-        self.transform = transforms.Compose([
+        # 训练: 随机裁剪 + 数据增强
+        self.train_transform = transforms.Compose([
+            transforms.RandomCrop(config.IMG_SIZE),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
             transforms.ToTensor(),
         ])
-        # 验证集不做翻转
+        # 验证: 确定性裁剪 (短边 resize + 中心裁剪)
         self.val_transform = transforms.Compose([
+            transforms.CenterCrop(config.IMG_SIZE),
             transforms.ToTensor(),
         ])
-        self.is_train = (split == "train")
 
     def __len__(self):
         return len(self.paths) * self.patches_per_image
@@ -55,16 +68,16 @@ class RealPatchDataset(Dataset):
         img_idx = idx // self.patches_per_image
         img = Image.open(self.paths[img_idx]).convert("RGB")
 
-        # 确保图像足够大, 否则先 resize
-        w, h = img.size
-        if w < config.IMG_SIZE or h < config.IMG_SIZE:
-            scale = max(config.IMG_SIZE / w, config.IMG_SIZE / h) + 0.01
-            img = img.resize((int(w * scale), int(h * scale)), Image.BICUBIC)
-
-        img = self.crop(img)
         if self.is_train:
-            img = self.transform(img)
+            # 确保图像足够大
+            w, h = img.size
+            if w < config.IMG_SIZE or h < config.IMG_SIZE:
+                scale = max(config.IMG_SIZE / w, config.IMG_SIZE / h) + 0.01
+                img = img.resize((int(w * scale), int(h * scale)), Image.BICUBIC)
+            img = self.train_transform(img)
         else:
+            # 确定性: 短边 resize 到 288 + CenterCrop 256
+            img = _resize_shorter_side(img, target_short=288)
             img = self.val_transform(img)
         return img
 
@@ -72,7 +85,8 @@ class RealPatchDataset(Dataset):
 class ChameleonTestDataset(Dataset):
     """
     Chameleon zero-shot 测试集
-    加载 real + fake, 统一 resize 到 256x256
+    确定性预处理: Resize(shorter_side=288) + CenterCrop(256)
+    与训练验证集保持同一 pipeline, 不做拉伸变形
     返回 (img, label): label=0 real, label=1 fake
     """
     def __init__(self):
@@ -85,7 +99,7 @@ class ChameleonTestDataset(Dataset):
             self.items.append((p, 1))
 
         self.transform = transforms.Compose([
-            transforms.Resize((config.IMG_SIZE, config.IMG_SIZE)),
+            transforms.CenterCrop(config.IMG_SIZE),
             transforms.ToTensor(),
         ])
 
@@ -95,6 +109,7 @@ class ChameleonTestDataset(Dataset):
     def __getitem__(self, idx):
         path, label = self.items[idx]
         img = Image.open(path).convert("RGB")
+        img = _resize_shorter_side(img, target_short=288)
         img = self.transform(img)
         return img, label
 

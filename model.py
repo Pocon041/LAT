@@ -157,20 +157,20 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size):
 def random_token_mask(num_tokens, mask_ratio):
     """
     随机 token 掩码
-    返回: mask [num_tokens], 1 表示被 mask, 0 表示可见
+    返回: (mask [num_tokens], actual_ratio)
     """
     num_mask = int(num_tokens * mask_ratio)
     num_mask = max(1, min(num_mask, num_tokens - 1))
     perm = torch.randperm(num_tokens)
     mask = torch.zeros(num_tokens, dtype=torch.bool)
     mask[perm[:num_mask]] = True
-    return mask
+    return mask, num_mask / num_tokens
 
 
 def block_mask(grid_size, mask_ratio):
     """
     连续块掩码: 在 grid_size x grid_size 网格上随机选一个矩形块
-    返回: mask [grid_size*grid_size], 1 表示被 mask, 0 表示可见
+    返回: (mask [grid_size*grid_size], actual_ratio)
     """
     num_tokens = grid_size * grid_size
     target_masked = int(num_tokens * mask_ratio)
@@ -188,11 +188,16 @@ def block_mask(grid_size, mask_ratio):
 
     mask = torch.zeros(grid_size, grid_size, dtype=torch.bool)
     mask[top:top + h, left:left + w] = True
-    return mask.reshape(-1)
+    flat = mask.reshape(-1)
+    actual = flat.sum().item() / num_tokens
+    return flat, actual
 
 
 def sample_mask(grid_size, mask_ratio, mask_type="random"):
-    """统一的掩码采样接口"""
+    """
+    统一的掩码采样接口
+    返回: (mask [N], actual_ratio)
+    """
     num_tokens = grid_size * grid_size
     if mask_type == "random":
         return random_token_mask(num_tokens, mask_ratio)
@@ -208,6 +213,7 @@ def sample_train_mask(grid_size):
     - 80% 概率从主体分布 [0.3, 0.5, 0.6] 采样
     - 20% 概率从辅助分布 [0.05, 0.10] 采样
     - mask 类型: random 和 block 各 50%
+    返回: (mask, actual_ratio, mask_type)
     """
     if random.random() < config.MASK_MAIN_PROB:
         ratio = random.choice(config.MASK_RATIOS_MAIN)
@@ -215,7 +221,8 @@ def sample_train_mask(grid_size):
         ratio = random.choice(config.MASK_RATIOS_AUX)
 
     mask_type = random.choice(["random", "block"])
-    return sample_mask(grid_size, ratio, mask_type), ratio, mask_type
+    mask, actual_ratio = sample_mask(grid_size, ratio, mask_type)
+    return mask, actual_ratio, mask_type
 
 
 # ============================================================
@@ -373,7 +380,7 @@ if __name__ == "__main__":
     # 阶段二测试
     B = x.shape[0]
     masks = torch.stack([
-        sample_mask(config.LATENT_SPATIAL, 0.5, "random") for _ in range(B)
+        sample_mask(config.LATENT_SPATIAL, 0.5, "random")[0] for _ in range(B)
     ])
     z_orig, z_hat = model.forward_stage2(x, masks)
     print(f"[阶段二] Z: {z_orig.shape}, Z_hat: {z_hat.shape}")

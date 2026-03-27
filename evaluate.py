@@ -46,7 +46,7 @@ def compute_masked_error(model, z, mask_ratio, mask_type, K, grid_size):
     """
     对单个 latent z 做 K 次不同 mask 的补全, 计算平均误差
     z: [1, C, H, W]
-    返回: mean_l1_err, mean_cos_err, per_run_z_hats, per_run_masks
+    返回: mean_l1_err, mean_cos_err, per_run_z_hats, per_run_masks, mean_actual_ratio
     """
     B, C, H, W = z.shape
     N = H * W
@@ -56,9 +56,12 @@ def compute_masked_error(model, z, mask_ratio, mask_type, K, grid_size):
     cos_errors = []
     z_hats_flat = []
     used_masks = []
+    actual_ratios = []
 
     for _ in range(K):
-        mask = sample_mask(grid_size, mask_ratio, mask_type).unsqueeze(0).to(z.device)
+        mask, actual_ratio = sample_mask(grid_size, mask_ratio, mask_type)
+        actual_ratios.append(actual_ratio)
+        mask = mask.unsqueeze(0).to(z.device)
         z_hat = model.predict(z, mask)
         z_hat_flat = z_hat.flatten(2).permute(0, 2, 1)  # [1, N, C]
 
@@ -82,13 +85,16 @@ def compute_masked_error(model, z, mask_ratio, mask_type, K, grid_size):
 
     mean_l1 = np.mean(l1_errors) if l1_errors else 0.0
     mean_cos = np.mean(cos_errors) if cos_errors else 0.0
-    return mean_l1, mean_cos, z_hats_flat, used_masks
+    mean_actual_ratio = np.mean(actual_ratios) if actual_ratios else mask_ratio
+    return mean_l1, mean_cos, z_hats_flat, used_masks, mean_actual_ratio
 
 
 @torch.no_grad()
-def compute_base_error(model, z, grid_size, base_ratio=None, base_runs=None):
+def compute_base_error(model, z, grid_size, mask_type="random",
+                      base_ratio=None, base_runs=None):
     """
     计算 base 误差 (低 mask ratio, 作为归一化基准)
+    mask_type 与评估条件保持一致, 避免混入 mask 形状差异
     """
     if base_ratio is None:
         base_ratio = config.EVAL_BASE_MASK_RATIO
@@ -101,7 +107,8 @@ def compute_base_error(model, z, grid_size, base_ratio=None, base_runs=None):
     z_flat = z.flatten(2).permute(0, 2, 1)
 
     for _ in range(base_runs):
-        mask = sample_mask(grid_size, base_ratio, "random").unsqueeze(0).to(z.device)
+        mask, _ = sample_mask(grid_size, base_ratio, mask_type)
+        mask = mask.unsqueeze(0).to(z.device)
         z_hat = model.predict(z, mask)
         z_hat_flat = z_hat.flatten(2).permute(0, 2, 1)
 
@@ -230,25 +237,36 @@ def evaluate(args):
     dl_test = DataLoader(ds_test, batch_size=1, shuffle=False, num_workers=2)
     log(f"Chameleon 测试集: {len(ds_test)} 张", log_file)
 
-    # --- 第一步: 在真实验证集上计算 tau ---
-    log("计算 tau (基于验证集 base 误差)...", log_file)
-    ds_val = RealPatchDataset(patches_per_image=1, split="val")
-    dl_val = DataLoader(ds_val, batch_size=1, shuffle=False, num_workers=2)
-
-    base_l1_list = []
-    for batch in dl_val:
-        x = batch.to(device)
-        z = model.encode(x)
-        base_l1, _ = compute_base_error(model, z, grid_size)
-        base_l1_list.append(base_l1)
-
-    tau_l1 = np.percentile(base_l1_list, config.TAU_PERCENTILE)
-    log(f"tau_l1 = {tau_l1:.6f} (base 误差 {config.TAU_PERCENTILE}% 分位数)", log_file)
-
-    # --- 第二步: 对每个评估条件计算分数 ---
+    # --- 第一步: 在真实验证集上按 mask_type 分别统计 tau ---
     mask_types = ["random", "block"]
     eval_ratios = config.EVAL_MASK_RATIOS
 
+    log("计算 tau (基于验证集 base 误差, 按 mask_type 分别统计)...", log_file)
+    ds_val = RealPatchDataset(patches_per_image=1, split="val")
+    dl_val = DataLoader(ds_val, batch_size=1, shuffle=False, num_workers=2)
+
+    # 先提取所有验证集 latent
+    val_latents = []
+    for batch in dl_val:
+        x = batch.to(device)
+        z = model.encode(x)
+        val_latents.append(z)
+
+    tau_dict = {}  # {mask_type: {"l1": float, "cos": float}}
+    for mtype in mask_types:
+        base_l1_list = []
+        base_cos_list = []
+        for z in val_latents:
+            bl1, bcos = compute_base_error(model, z, grid_size, mask_type=mtype)
+            base_l1_list.append(bl1)
+            base_cos_list.append(bcos)
+        t_l1 = np.percentile(base_l1_list, config.TAU_PERCENTILE)
+        t_cos = np.percentile(base_cos_list, config.TAU_PERCENTILE)
+        tau_dict[mtype] = {"l1": t_l1, "cos": t_cos}
+        log(f"  tau[{mtype}]: l1={t_l1:.6f}, cos={t_cos:.6f} "
+            f"({config.TAU_PERCENTILE}% 分位数)", log_file)
+
+    # --- 第二步: 对每个评估条件计算分数 ---
     all_results = {}
 
     for mtype in mask_types:
@@ -261,25 +279,31 @@ def evaluate(args):
             scores_var = []
             labels = []
             complexity_feats = []
+            actual_ratios_all = []
 
             for x, label in dl_test:
                 x = x.to(device)
                 z = model.encode(x)
 
                 # 计算 mask 误差
-                mean_l1, mean_cos, z_hats, used_masks = compute_masked_error(
+                mean_l1, mean_cos, z_hats, used_masks, act_ratio = compute_masked_error(
                     model, z, mratio, mtype, K, grid_size
                 )
 
-                # 计算 base 误差
-                base_l1, base_cos = compute_base_error(model, z, grid_size)
+                # 计算 base 误差 (与当前评估条件同一 mask_type)
+                base_l1, base_cos = compute_base_error(
+                    model, z, grid_size, mask_type=mtype
+                )
+
+                # 使用对应 mask_type 的 tau
+                tau_l1 = tau_dict[mtype]["l1"]
+                tau_cos = tau_dict[mtype]["cos"]
 
                 # S_logratio (L1 版本)
                 s_lr_l1 = np.log((mean_l1 + tau_l1) / (base_l1 + tau_l1))
                 scores_logratio_l1.append(s_lr_l1)
 
-                # S_logratio (cosine 版本, tau 用同一个量级)
-                tau_cos = tau_l1 * 0.1  # cosine 误差量级不同, 适当缩放
+                # S_logratio (cosine 版本)
                 s_lr_cos = np.log((mean_cos + tau_cos) / (base_cos + tau_cos))
                 scores_logratio_cos.append(s_lr_cos)
 
@@ -289,6 +313,7 @@ def evaluate(args):
                 else:
                     s_var = 0.0
                 scores_var.append(s_var)
+                actual_ratios_all.append(act_ratio)
 
                 labels.append(label.item())
 
@@ -314,6 +339,8 @@ def evaluate(args):
             except ValueError:
                 auroc_cos = aupr_cos = float("nan")
 
+            mean_act_ratio = np.mean(actual_ratios_all)
+            log(f"  实际 mask 比例均值: {mean_act_ratio:.4f} (目标 {mratio:.2f})", log_file)
             log(f"  S_logratio(L1):  AUROC={auroc_l1:.4f}, AUPR={aupr_l1:.4f}", log_file)
             log(f"  S_logratio(cos): AUROC={auroc_cos:.4f}, AUPR={aupr_cos:.4f}", log_file)
             log(f"  S_var 均值: real={s_vars[labels == 0].mean():.6f}, "
@@ -334,7 +361,9 @@ def evaluate(args):
                 "aupr_cos": float(aupr_cos),
                 "s_var_real_mean": float(s_vars[labels == 0].mean()),
                 "s_var_fake_mean": float(s_vars[labels == 1].mean()),
-                "tau_l1": float(tau_l1),
+                "tau_l1": float(tau_dict[mtype]["l1"]),
+                "tau_cos": float(tau_dict[mtype]["cos"]),
+                "actual_mask_ratio_mean": float(mean_act_ratio),
                 "K": K,
             }
 

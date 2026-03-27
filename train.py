@@ -229,29 +229,42 @@ def train_stage2(args):
         train_l1_avg = train_l1_sum / train_count
         train_cos_avg = train_cos_sum / train_count
 
-        # --- 验证: 固定 mask ratio=0.5, random ---
+        # --- 验证: 多条件面板平均 ---
         model.predictor.eval()
-        val_loss_sum = 0.0
-        val_count = 0
+        val_panel = [
+            (0.30, "random"),
+            (0.50, "random"),
+            (0.60, "random"),
+            (0.50, "block"),
+        ]
+        panel_losses = []
 
         with torch.no_grad():
-            for batch in dl_val:
-                x = batch.to(device)
-                B = x.size(0)
-                masks = torch.stack([
-                    sample_mask(grid_size, 0.5, "random") for _ in range(B)
-                ]).to(device)
+            for p_ratio, p_type in val_panel:
+                vl_sum = 0.0
+                vl_count = 0
+                for batch in dl_val:
+                    x = batch.to(device)
+                    B = x.size(0)
+                    masks = torch.stack([
+                        sample_mask(grid_size, p_ratio, p_type)[0] for _ in range(B)
+                    ]).to(device)
 
-                z, z_hat = model.forward_stage2(x, masks)
-                loss, loss_dict = criterion(z, z_hat, masks)
-                val_loss_sum += loss_dict["total"] * B
-                val_count += B
+                    z, z_hat = model.forward_stage2(x, masks)
+                    loss, loss_dict = criterion(z, z_hat, masks)
+                    vl_sum += loss_dict["total"] * B
+                    vl_count += B
+                panel_losses.append(vl_sum / vl_count)
 
-        val_avg = val_loss_sum / val_count
+        val_avg = sum(panel_losses) / len(panel_losses)
+        panel_str = " | ".join(
+            f"{t}_{int(r*100)}%={l:.6f}" for (r, t), l in zip(val_panel, panel_losses)
+        )
 
         msg = (f"[S2] Epoch {epoch}/{config.S2_EPOCHS} | "
                f"train: total={train_avg:.6f} l1={train_l1_avg:.6f} cos={train_cos_avg:.6f} | "
-               f"val_loss={val_avg:.6f} | lr={scheduler.get_last_lr()[0]:.2e}")
+               f"val_avg={val_avg:.6f} [{panel_str}] | "
+               f"lr={scheduler.get_last_lr()[0]:.2e}")
         log(msg, log_file)
 
         # 保存最优
