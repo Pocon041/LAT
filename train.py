@@ -4,6 +4,7 @@ import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import config
 from dataset import RealPatchDataset
@@ -32,7 +33,7 @@ def train_stage1(args):
 
     # 数据
     ds_train = RealPatchDataset(patches_per_image=8, split="train")
-    ds_val = RealPatchDataset(patches_per_image=4, split="val")
+    ds_val = RealPatchDataset(split="val")
     dl_train = DataLoader(
         ds_train, batch_size=config.S1_BATCH_SIZE,
         shuffle=True, num_workers=config.S1_NUM_WORKERS,
@@ -67,7 +68,8 @@ def train_stage1(args):
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch in dl_train:
+        pbar = tqdm(dl_train, desc=f"[S1] Epoch {epoch}/{config.S1_EPOCHS} train")
+        for batch in pbar:
             x = batch.to(device)
             x_recon, z = model.forward_stage1(x)
             loss, loss_dict = criterion(x, x_recon)
@@ -79,6 +81,7 @@ def train_stage1(args):
 
             train_loss_sum += loss_dict["total"] * x.size(0)
             train_count += x.size(0)
+            pbar.set_postfix(loss=f"{loss_dict['total']:.4f}")
 
         scheduler.step()
         train_avg = train_loss_sum / train_count
@@ -90,7 +93,7 @@ def train_stage1(args):
         val_count = 0
 
         with torch.no_grad():
-            for batch in dl_val:
+            for batch in tqdm(dl_val, desc=f"[S1] Epoch {epoch}/{config.S1_EPOCHS} val"):
                 x = batch.to(device)
                 x_recon, z = model.forward_stage1(x)
                 loss, loss_dict = criterion(x, x_recon)
@@ -144,7 +147,7 @@ def train_stage2(args):
 
     # 数据
     ds_train = RealPatchDataset(patches_per_image=8, split="train")
-    ds_val = RealPatchDataset(patches_per_image=4, split="val")
+    ds_val = RealPatchDataset(split="val")
     dl_train = DataLoader(
         ds_train, batch_size=config.S2_BATCH_SIZE,
         shuffle=True, num_workers=config.S2_NUM_WORKERS,
@@ -200,7 +203,8 @@ def train_stage2(args):
         train_cos_sum = 0.0
         train_count = 0
 
-        for batch in dl_train:
+        pbar = tqdm(dl_train, desc=f"[S2] Epoch {epoch}/{config.S2_EPOCHS} train")
+        for batch in pbar:
             x = batch.to(device)
             B = x.size(0)
 
@@ -223,6 +227,7 @@ def train_stage2(args):
             train_l1_sum += loss_dict["l1"] * B
             train_cos_sum += loss_dict["cos"] * B
             train_count += B
+            pbar.set_postfix(loss=f"{loss_dict['total']:.4f}")
 
         scheduler.step()
         train_avg = train_loss_sum / train_count
@@ -243,7 +248,7 @@ def train_stage2(args):
             for p_ratio, p_type in val_panel:
                 vl_sum = 0.0
                 vl_count = 0
-                for batch in dl_val:
+                for batch in tqdm(dl_val, desc=f"  val {p_type}_{int(p_ratio*100)}%", leave=False):
                     x = batch.to(device)
                     B = x.size(0)
                     masks = torch.stack([

@@ -1,0 +1,17 @@
+[阶段一] 设备: cuda
+训练集: 27600 patches, 验证集: 100 patches
+[阶段一] 设备: cuda
+训练集: 27600 patches, 验证集: 100 patches
+[阶段一] 设备: cuda
+训练集: 26000 patches, 验证集: 300 patches
+[S1] Epoch 1/200 | train_loss=0.073878 | val_loss=0.077991 | lr=2.00e-04
+  -> 保存最优 AE (val_loss=0.077991)
+[S1] Epoch 2/200 | train_loss=0.054924 | val_loss=0.064175 | lr=2.00e-04
+  -> 保存最优 AE (val_loss=0.064175)
+[S1] Epoch 3/200 | train_loss=0.049888 | val_loss=0.060123 | lr=2.00e-04
+  -> 保存最优 AE (val_loss=0.060123)
+[S1] Epoch 4/200 | train_loss=0.046548 | val_loss=0.063795 | lr=2.00e-04
+[S1] Epoch 5/200 | train_loss=0.044859 | val_loss=0.064581 | lr=2.00e-04
+[S1] Epoch 6/200 | train_loss=0.042706 | val_loss=0.060178 | lr=2.00e-04
+[S1] Epoch 7/200 | train_loss=0.041255 | val_loss=0.053301 | lr=1.99e-04
+  -> 保存最优 AE (val_loss=0.053301)

@@ -267,7 +267,8 @@ class Predictor(nn.Module):
             norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers
+            encoder_layer, num_layers=num_layers,
+            enable_nested_tensor=False,
         )
         self.norm = nn.LayerNorm(embed_dim)
 

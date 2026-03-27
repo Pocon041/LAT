@@ -4,6 +4,7 @@ import os
 DIV2K_TRAIN_DIR = r"D:\PNG_Dataset\DIV2K_train_HR"
 DIV2K_VAL_DIR = r"D:\PNG_Dataset\DIV2K_valid_HR"
 FLICKR2K_DIR = r"D:\Flickr2K\Flickr2K_HR"
+FLICKR2K_VAL_COUNT = 200   # Flickr2K 尾部 200 张划给验证集
 
 # Chameleon zero-shot 测试集
 CHAMELEON_REAL_DIR = r"D:\Chameleon\test\0_real"

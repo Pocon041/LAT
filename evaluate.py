@@ -8,6 +8,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from scipy.stats import pearsonr
 from PIL import Image
 from torchvision import transforms
+from tqdm import tqdm
 
 import config
 from dataset import ChameleonTestDataset, RealPatchDataset
@@ -247,7 +248,7 @@ def evaluate(args):
 
     # 先提取所有验证集 latent
     val_latents = []
-    for batch in dl_val:
+    for batch in tqdm(dl_val, desc="提取验证集 latent"):
         x = batch.to(device)
         z = model.encode(x)
         val_latents.append(z)
@@ -256,7 +257,7 @@ def evaluate(args):
     for mtype in mask_types:
         base_l1_list = []
         base_cos_list = []
-        for z in val_latents:
+        for z in tqdm(val_latents, desc=f"  tau[{mtype}]", leave=False):
             bl1, bcos = compute_base_error(model, z, grid_size, mask_type=mtype)
             base_l1_list.append(bl1)
             base_cos_list.append(bcos)
@@ -281,7 +282,7 @@ def evaluate(args):
             complexity_feats = []
             actual_ratios_all = []
 
-            for x, label in dl_test:
+            for x, label in tqdm(dl_test, desc=f"{condition}"):
                 x = x.to(device)
                 z = model.encode(x)
 

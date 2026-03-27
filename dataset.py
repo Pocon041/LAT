@@ -38,14 +38,22 @@ class RealPatchDataset(Dataset):
         super().__init__()
         self.is_train = (split == "train")
 
+        flickr_all = _collect_images(config.FLICKR2K_DIR)
+        flickr_split = len(flickr_all) - config.FLICKR2K_VAL_COUNT
+        flickr_train = flickr_all[:flickr_split]
+        flickr_val = flickr_all[flickr_split:]
+
         if split == "train":
             self.paths = (
                 _collect_images(config.DIV2K_TRAIN_DIR)
-                + _collect_images(config.FLICKR2K_DIR)
+                + flickr_train
             )
             self.patches_per_image = patches_per_image
         else:
-            self.paths = _collect_images(config.DIV2K_VAL_DIR)
+            self.paths = (
+                _collect_images(config.DIV2K_VAL_DIR)
+                + flickr_val
+            )
             self.patches_per_image = 1  # val 每张图只出一个确定性 patch
 
         # 训练: 随机裁剪 + 数据增强
@@ -116,7 +124,7 @@ class ChameleonTestDataset(Dataset):
 
 if __name__ == "__main__":
     ds_train = RealPatchDataset(split="train")
-    ds_val = RealPatchDataset(split="val", patches_per_image=4)
+    ds_val = RealPatchDataset(split="val")
     ds_test = ChameleonTestDataset()
 
     print(f"训练集: {len(ds_train.paths)} 张原图, "
