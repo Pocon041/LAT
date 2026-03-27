@@ -1,0 +1,29 @@
+训练开始 | mode=A0, epochs=300, batch=16, lr=0.0001
+损失权重: L1=1.0, LPIPS=0.5, Freq=0.1, alpha=1.0
+[Epoch 001/300] kr=none train: full=0.4378 mask=0.0000 total=0.4378 | val=0.4059 | 263.2s
+  -> 保存最优模型 (val=0.4059)
+[Epoch 002/300] kr=none train: full=0.3880 mask=0.0000 total=0.3880 | val=0.3817 | 204.1s
+  -> 保存最优模型 (val=0.3817)
+[Epoch 003/300] kr=none train: full=0.3667 mask=0.0000 total=0.3667 | val=0.3786 | 146.2s
+  -> 保存最优模型 (val=0.3786)
+[Epoch 004/300] kr=none train: full=0.3498 mask=0.0000 total=0.3498 | val=0.3435 | 147.7s
+  -> 保存最优模型 (val=0.3435)
+[Epoch 005/300] kr=none train: full=0.3338 mask=0.0000 total=0.3338 | val=0.3434 | 182.5s
+  -> 保存最优模型 (val=0.3434)
+[Epoch 006/300] kr=none train: full=0.3282 mask=0.0000 total=0.3282 | val=0.3340 | 187.7s
+  -> 保存最优模型 (val=0.3340)
+[Epoch 007/300] kr=none train: full=0.3196 mask=0.0000 total=0.3196 | val=0.3294 | 155.5s
+  -> 保存最优模型 (val=0.3294)
+[Epoch 008/300] kr=none train: full=0.3147 mask=0.0000 total=0.3147 | val=0.3152 | 152.7s
+  -> 保存最优模型 (val=0.3152)
+[Epoch 009/300] kr=none train: full=0.3035 mask=0.0000 total=0.3035 | val=0.3105 | 153.1s
+  -> 保存最优模型 (val=0.3105)
+[Epoch 010/300] kr=none train: full=0.2984 mask=0.0000 total=0.2984 | val=0.3073 | 159.9s
+  -> 保存最优模型 (val=0.3073)
+[Epoch 011/300] kr=none train: full=0.2945 mask=0.0000 total=0.2945 | val=0.2995 | 152.8s
+  -> 保存最优模型 (val=0.2995)
+[Epoch 012/300] kr=none train: full=0.2890 mask=0.0000 total=0.2890 | val=0.3043 | 152.6s
+[Epoch 013/300] kr=none train: full=0.2826 mask=0.0000 total=0.2826 | val=0.2909 | 152.3s
+  -> 保存最优模型 (val=0.2909)
+[Epoch 014/300] kr=none train: full=0.2795 mask=0.0000 total=0.2795 | val=0.2847 | 152.4s
+  -> 保存最优模型 (val=0.2847)
