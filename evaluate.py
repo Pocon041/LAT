@@ -1,303 +1,355 @@
-"""
-评估脚本: 对指定模型跑 Exp0 + Exp1(f3_pca_truncate) 在源域和 Chameleon 上
-
-用法:
-  python evaluate.py --mode A0
-  python evaluate.py --mode A1
-  python evaluate.py --mode all
-"""
 import os
-import sys
 import json
 import argparse
-import torch
 import numpy as np
+import torch
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
+from scipy.stats import pearsonr
+from PIL import Image
+from torchvision import transforms
 
 import config
-from model import SimpleAE
-from dataset import RealTrainDataset, RealValDataset, GenImageTestDataset, ChameleonTestDataset
-from losses import load_lpips_vgg, FreqLoss
+from dataset import ChameleonTestDataset, RealPatchDataset
+from model import LatentMAE, sample_mask
 
 
-# ==================== PCA 工具 ====================
-
-def fit_pca(model, dataloader, device, n_samples=2000):
-    """在 real 数据上拟合 PCA"""
-    model.eval()
-    all_z = []
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="拟合PCA", file=sys.stdout):
-            x = batch.to(device)
-            z = model.encode(x)
-            all_z.append(z.view(z.size(0), -1).cpu())
-            if sum(t.size(0) for t in all_z) >= n_samples:
-                break
-    all_z = torch.cat(all_z, dim=0)[:n_samples]
-    mean = all_z.mean(dim=0)
-    centered = all_z - mean
-    U, S, Vt = torch.linalg.svd(centered, full_matrices=False)
-    return mean, Vt
+def log(msg, log_file=None):
+    print(msg)
+    if log_file:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
 
 
-def f3_pca_truncate(z, pca_mean, pca_Vt, n_components, latent_shape):
-    B = z.size(0)
-    z_flat = z.view(B, -1)
-    centered = z_flat - pca_mean
-    proj = centered @ pca_Vt[:n_components].T @ pca_Vt[:n_components]
-    return (proj + pca_mean).view(B, *latent_shape)
+def load_model(exp_dir, device):
+    """加载完整模型 (AE + Predictor)"""
+    model = LatentMAE(latent_channels=config.LATENT_CHANNELS).to(device)
 
+    ae_path = os.path.join(exp_dir, "best_ae.pth")
+    pred_path = os.path.join(exp_dir, "best_predictor.pth")
 
-# ==================== 预计算缓存 ====================
+    ae_ckpt = torch.load(ae_path, map_location=device, weights_only=True)
+    model.encoder.load_state_dict(ae_ckpt["encoder"])
+    model.decoder.load_state_dict(ae_ckpt["decoder"])
+    print(f"加载 AE: {ae_path} (epoch={ae_ckpt['epoch']})")
 
-def precompute_cache(model, dataloader, lpips_fn, device):
-    all_z = []
-    all_d_base = []
-    all_labels = []
-    model.eval()
-    with torch.no_grad():
-        for img, label, sources in tqdm(dataloader, desc="预计算缓存", file=sys.stdout):
-            img = img.to(device)
-            z = model.encode(img)
-            recon = model.decode(z)
-            d_base = lpips_fn(img * 2 - 1, recon * 2 - 1).view(-1)
-            all_z.append(z.cpu().half())
-            all_d_base.append(d_base.cpu())
-            all_labels.append(label)
-    return torch.cat(all_z), torch.cat(all_d_base), torch.cat(all_labels)
-
-
-def evaluate_f3_fast(model, val_loader, all_z, all_d_base, all_labels,
-                     pca_mean, pca_Vt, n_components, latent_shape,
-                     lpips_fn, device):
-    deltas = torch.zeros(all_z.size(0))
-    idx = 0
-    model.eval()
-    with torch.no_grad():
-        for img, label, sources in tqdm(val_loader, desc=f"    f3 n={n_components}", leave=False, file=sys.stdout):
-            B = img.size(0)
-            img = img.to(device)
-            z = all_z[idx:idx+B].to(device).float()
-            z_f = f3_pca_truncate(z, pca_mean, pca_Vt, n_components, latent_shape)
-            recon_f = model.decode(z_f)
-            d_f = lpips_fn(img * 2 - 1, recon_f * 2 - 1).view(-1).cpu()
-            d_base = all_d_base[idx:idx+B]
-            deltas[idx:idx+B] = d_f - d_base
-            idx += B
-
-    labels_np = all_labels.numpy()
-    dr = deltas[labels_np == 0].tolist()
-    df = deltas[labels_np == 1].tolist()
-    return dr, df
-
-
-# ==================== Exp0 ====================
-
-def run_exp0(model, dataloader, lpips_fn, freq_fn, device, name):
-    print(f"\n{'='*70}", flush=True)
-    print(f"Exp0 [{name}]: Baseline 重建误差", flush=True)
-    print(f"{'='*70}", flush=True)
-
-    all_real = {"l1": [], "lpips": [], "freq": []}
-    all_fake = {"l1": [], "lpips": [], "freq": []}
+    pred_ckpt = torch.load(pred_path, map_location=device, weights_only=True)
+    model.predictor.load_state_dict(pred_ckpt["predictor"])
+    print(f"加载 Predictor: {pred_path} (epoch={pred_ckpt['epoch']})")
 
     model.eval()
-    with torch.no_grad():
-        for img, label, sources in tqdm(dataloader, desc="Exp0", file=sys.stdout):
-            img = img.to(device)
-            recon, z = model(img)
-            for i in range(img.size(0)):
-                x_i = img[i:i+1]
-                r_i = recon[i:i+1]
-                target = all_fake if label[i].item() == 1 else all_real
-                target["l1"].append((x_i - r_i).abs().mean().item())
-                target["lpips"].append(lpips_fn(x_i * 2 - 1, r_i * 2 - 1).item())
-                target["freq"].append(freq_fn(x_i, r_i).item())
+    return model
 
-    result = {}
-    print(f"\n{'Split':<8} {'L1':>8} {'LPIPS':>8} {'Freq':>8} {'N':>6}")
-    print("-" * 45)
-    for split, agg in [("real", all_real), ("fake", all_fake)]:
-        if not agg["l1"]:
+
+@torch.no_grad()
+def compute_masked_error(model, z, mask_ratio, mask_type, K, grid_size):
+    """
+    对单个 latent z 做 K 次不同 mask 的补全, 计算平均误差
+    z: [1, C, H, W]
+    返回: mean_l1_err, mean_cos_err, per_run_z_hats, per_run_masks
+    """
+    B, C, H, W = z.shape
+    N = H * W
+    z_flat = z.flatten(2).permute(0, 2, 1)  # [1, N, C]
+
+    l1_errors = []
+    cos_errors = []
+    z_hats_flat = []
+    used_masks = []
+
+    for _ in range(K):
+        mask = sample_mask(grid_size, mask_ratio, mask_type).unsqueeze(0).to(z.device)
+        z_hat = model.predict(z, mask)
+        z_hat_flat = z_hat.flatten(2).permute(0, 2, 1)  # [1, N, C]
+
+        m = mask[0]  # [N]
+        if m.sum() == 0:
             continue
-        result[split] = {k: float(np.mean(v)) for k, v in agg.items()}
-        result[split]["n"] = len(agg["l1"])
-        print(f"{split:<8} {np.mean(agg['l1']):8.4f} {np.mean(agg['lpips']):8.4f} "
-              f"{np.mean(agg['freq']):8.4f} {len(agg['l1']):6d}")
 
-    if all_real["l1"] and all_fake["l1"]:
-        print("\nOOD Ratio (fake/real):")
-        for k in ["l1", "lpips", "freq"]:
-            ratio = np.mean(all_fake[k]) / (np.mean(all_real[k]) + 1e-8)
-            print(f"  {k:>6}: {ratio:.3f}")
-        result["ood_ratio"] = {k: np.mean(all_fake[k]) / (np.mean(all_real[k]) + 1e-8) for k in ["l1", "lpips", "freq"]}
+        z_masked = z_flat[0, m]        # [M, C]
+        z_hat_masked = z_hat_flat[0, m]  # [M, C]
 
-    return result
+        l1_err = (z_masked - z_hat_masked).abs().mean().item()
+        l1_errors.append(l1_err)
 
+        cos_sim = torch.nn.functional.cosine_similarity(
+            z_masked, z_hat_masked, dim=-1
+        ).mean().item()
+        cos_errors.append(1.0 - cos_sim)
 
-# ==================== Exp1 f3 ====================
+        z_hats_flat.append(z_hat_flat)
+        used_masks.append(m)  # 保留实际使用的 mask
 
-def run_exp1_f3(model, val_loader, calib_loader, lpips_fn, device, name):
-    print(f"\n{'='*70}", flush=True)
-    print(f"Exp1 f3_pca [{name}]: Latent PCA 截断", flush=True)
-    print(f"{'='*70}", flush=True)
-
-    # 预计算
-    all_z, all_d_base, all_labels = precompute_cache(model, val_loader, lpips_fn, device)
-    print(f"缓存: {all_z.shape[0]} 样本", flush=True)
-
-    # PCA 拟合 (用 calib real)
-    pca_mean, pca_Vt = fit_pca(model, calib_loader, device, n_samples=2000)
-    pca_mean = pca_mean.to(device)
-    pca_Vt = pca_Vt.to(device)
-    max_rank = pca_Vt.size(0)
-    latent_shape = (config.LATENT_CHANNELS, config.LATENT_SPATIAL, config.LATENT_SPATIAL)
-    print(f"PCA max_rank={max_rank}", flush=True)
-
-    keep_ratios = [0.9, 0.7, 0.5, 0.3, 0.1]
-    results = {}
-
-    for kr in keep_ratios:
-        n_pca = max(1, int(max_rank * kr))
-        print(f"  keep={kr} (n_pca={n_pca})...", flush=True)
-        dr, df = evaluate_f3_fast(model, val_loader, all_z, all_d_base, all_labels,
-                                  pca_mean, pca_Vt, n_pca, latent_shape, lpips_fn, device)
-
-        labels = [0] * len(dr) + [1] * len(df)
-        scores = dr + df
-        auroc = roc_auc_score(labels, scores) if len(set(labels)) > 1 else 0.0
-
-        results[f"kr{kr}"] = {
-            "keep_ratio": kr, "n_pca": n_pca,
-            "real_delta": float(np.mean(dr)), "fake_delta": float(np.mean(df)),
-            "auroc": auroc,
-        }
-        print(f"    real={np.mean(dr):.4f}, fake={np.mean(df):.4f}, AUROC={auroc:.4f}", flush=True)
-
-    return results
+    mean_l1 = np.mean(l1_errors) if l1_errors else 0.0
+    mean_cos = np.mean(cos_errors) if cos_errors else 0.0
+    return mean_l1, mean_cos, z_hats_flat, used_masks
 
 
-# ==================== Main ====================
+@torch.no_grad()
+def compute_base_error(model, z, grid_size, base_ratio=None, base_runs=None):
+    """
+    计算 base 误差 (低 mask ratio, 作为归一化基准)
+    """
+    if base_ratio is None:
+        base_ratio = config.EVAL_BASE_MASK_RATIO
+    if base_runs is None:
+        base_runs = config.EVAL_BASE_RUNS
 
-def evaluate_one_model(mode, device, lpips_fn, freq_fn):
-    exp_dir = os.path.join(config.EXP_ROOT, mode)
-    ckpt = os.path.join(exp_dir, "best_ae.pth")
-    if not os.path.exists(ckpt):
-        print(f"跳过 {mode}: {ckpt} 不存在", flush=True)
-        return
+    l1_errors = []
+    cos_errors = []
+    B, C, H, W = z.shape
+    z_flat = z.flatten(2).permute(0, 2, 1)
 
-    print(f"\n{'#'*70}", flush=True)
-    print(f"# 评估模型: {mode}", flush=True)
-    print(f"{'#'*70}", flush=True)
+    for _ in range(base_runs):
+        mask = sample_mask(grid_size, base_ratio, "random").unsqueeze(0).to(z.device)
+        z_hat = model.predict(z, mask)
+        z_hat_flat = z_hat.flatten(2).permute(0, 2, 1)
 
-    model = SimpleAE(latent_channels=config.LATENT_CHANNELS).to(device)
-    model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
-    model.eval()
-    print(f"加载: {ckpt}", flush=True)
+        m = mask[0]
+        if m.sum() == 0:
+            continue
 
-    # calib: real val (DIV2K val)
-    calib_ds = RealValDataset()
-    calib_loader = DataLoader(calib_ds, batch_size=config.BATCH_SIZE,
-                              shuffle=False, num_workers=config.NUM_WORKERS)
+        z_masked = z_flat[0, m]
+        z_hat_masked = z_hat_flat[0, m]
+
+        l1_err = (z_masked - z_hat_masked).abs().mean().item()
+        cos_sim = torch.nn.functional.cosine_similarity(
+            z_masked, z_hat_masked, dim=-1
+        ).mean().item()
+
+        l1_errors.append(l1_err)
+        cos_errors.append(1.0 - cos_sim)
+
+    return np.mean(l1_errors), np.mean(cos_errors)
+
+
+@torch.no_grad()
+def compute_s_var(z_hats_flat_list, masks_list, grid_size):
+    """
+    计算 S_var: 对每个 token, 只统计该 token 被 mask 时的预测方差
+    z_hats_flat_list: list of [1, N, C] tensors
+    masks_list: list of [N] bool tensors
+    返回标量方差
+    """
+    if len(z_hats_flat_list) < 2:
+        return 0.0
+
+    N = grid_size * grid_size
+    C = z_hats_flat_list[0].shape[-1]
+    device = z_hats_flat_list[0].device
+
+    token_vars = []
+    for i in range(N):
+        # 收集该 token 在所有被 mask 的 run 中的预测
+        preds = []
+        for k, (z_hat, mask) in enumerate(zip(z_hats_flat_list, masks_list)):
+            if mask[i]:
+                preds.append(z_hat[0, i])  # [C]
+        if len(preds) >= 2:
+            preds_stack = torch.stack(preds)  # [K', C]
+            var = preds_stack.var(dim=0).mean().item()
+            token_vars.append(var)
+
+    return np.mean(token_vars) if token_vars else 0.0
+
+
+@torch.no_grad()
+def compute_complexity_features(img_tensor):
+    """
+    计算图像复杂度特征 (用于相关性分析)
+    img_tensor: [1, 3, H, W], 值域 [0, 1]
+    返回 dict
+    """
+    x = img_tensor[0]  # [3, H, W]
+    gray = x.mean(dim=0)  # [H, W]
+
+    # 边缘密度 (Sobel)
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                           dtype=torch.float32, device=x.device).reshape(1, 1, 3, 3)
+    sobel_y = sobel_x.permute(0, 1, 3, 2)
+    g = gray.unsqueeze(0).unsqueeze(0)
+    gx = torch.nn.functional.conv2d(g, sobel_x, padding=1)
+    gy = torch.nn.functional.conv2d(g, sobel_y, padding=1)
+    edge_density = (gx ** 2 + gy ** 2).sqrt().mean().item()
+
+    # 高频能量
+    fft = torch.fft.rfft2(gray, norm="ortho")
+    mag = fft.abs()
+    H, W2 = mag.shape
+    # 高频: 距离中心 > 0.5 * max_radius 的部分
+    fy = torch.arange(H, device=x.device).float()
+    fx = torch.arange(W2, device=x.device).float()
+    fy[fy > H // 2] -= H
+    gy_freq, gx_freq = torch.meshgrid(fy, fx, indexing="ij")
+    radius = (gy_freq ** 2 + gx_freq ** 2).sqrt()
+    max_r = radius.max()
+    hf_mask = radius > 0.5 * max_r
+    hf_energy = mag[hf_mask].pow(2).sum().item() / mag.pow(2).sum().item()
+
+    # Patch entropy (将图像分成 8x8 patch, 计算灰度直方图熵的均值)
+    patch_size = 32
+    entropies = []
+    for i in range(0, gray.shape[0] - patch_size + 1, patch_size):
+        for j in range(0, gray.shape[1] - patch_size + 1, patch_size):
+            patch = gray[i:i + patch_size, j:j + patch_size].flatten()
+            hist = torch.histc(patch, bins=32, min=0.0, max=1.0)
+            hist = hist / hist.sum()
+            hist = hist[hist > 0]
+            ent = -(hist * hist.log()).sum().item()
+            entropies.append(ent)
+    patch_entropy = np.mean(entropies) if entropies else 0.0
+
+    # 梯度能量
+    grad_energy = (gx ** 2 + gy ** 2).mean().item()
+
+    return {
+        "edge_density": edge_density,
+        "hf_energy": hf_energy,
+        "patch_entropy": patch_entropy,
+        "grad_energy": grad_energy,
+    }
+
+
+@torch.no_grad()
+def evaluate(args):
+    exp_dir = os.path.join(config.EXP_DIR, args.exp_name)
+    eval_dir = os.path.join(exp_dir, "eval")
+    os.makedirs(eval_dir, exist_ok=True)
+    log_file = os.path.join(eval_dir, "eval_log.txt")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log(f"设备: {device}", log_file)
+
+    # 加载模型
+    model = load_model(exp_dir, device)
+    grid_size = config.LATENT_SPATIAL
+    K = args.K
+
+    # 加载测试集
+    ds_test = ChameleonTestDataset()
+    dl_test = DataLoader(ds_test, batch_size=1, shuffle=False, num_workers=2)
+    log(f"Chameleon 测试集: {len(ds_test)} 张", log_file)
+
+    # --- 第一步: 在真实验证集上计算 tau ---
+    log("计算 tau (基于验证集 base 误差)...", log_file)
+    ds_val = RealPatchDataset(patches_per_image=1, split="val")
+    dl_val = DataLoader(ds_val, batch_size=1, shuffle=False, num_workers=2)
+
+    base_l1_list = []
+    for batch in dl_val:
+        x = batch.to(device)
+        z = model.encode(x)
+        base_l1, _ = compute_base_error(model, z, grid_size)
+        base_l1_list.append(base_l1)
+
+    tau_l1 = np.percentile(base_l1_list, config.TAU_PERCENTILE)
+    log(f"tau_l1 = {tau_l1:.6f} (base 误差 {config.TAU_PERCENTILE}% 分位数)", log_file)
+
+    # --- 第二步: 对每个评估条件计算分数 ---
+    mask_types = ["random", "block"]
+    eval_ratios = config.EVAL_MASK_RATIOS
 
     all_results = {}
 
-    # --- 源域 (GenImage) ---
-    gen_ds = GenImageTestDataset()
-    gen_loader = DataLoader(gen_ds, batch_size=config.BATCH_SIZE,
-                            shuffle=False, num_workers=config.NUM_WORKERS)
-    n_real = sum(1 for _, l, _ in gen_ds.items if l == 0)
-    n_fake = sum(1 for _, l, _ in gen_ds.items if l == 1)
-    print(f"\nGenImage: real={n_real}, fake={n_fake}", flush=True)
+    for mtype in mask_types:
+        for mratio in eval_ratios:
+            condition = f"{mtype}_{int(mratio * 100)}%"
+            log(f"\n--- 评估条件: {condition}, K={K} ---", log_file)
 
-    all_results["genimage_exp0"] = run_exp0(model, gen_loader, lpips_fn, freq_fn, device, "GenImage")
-    all_results["genimage_exp1_f3"] = run_exp1_f3(model, gen_loader, calib_loader, lpips_fn, device, "GenImage")
+            scores_logratio_l1 = []
+            scores_logratio_cos = []
+            scores_var = []
+            labels = []
+            complexity_feats = []
 
-    # --- Chameleon zero-shot ---
-    cham_ds = ChameleonTestDataset(max_per_class=2000)
-    cham_loader = DataLoader(cham_ds, batch_size=config.BATCH_SIZE,
-                             shuffle=False, num_workers=config.NUM_WORKERS)
-    n_real = sum(1 for _, l, _ in cham_ds.items if l == 0)
-    n_fake = sum(1 for _, l, _ in cham_ds.items if l == 1)
-    print(f"\nChameleon: real={n_real}, fake={n_fake}", flush=True)
+            for x, label in dl_test:
+                x = x.to(device)
+                z = model.encode(x)
 
-    all_results["chameleon_exp0"] = run_exp0(model, cham_loader, lpips_fn, freq_fn, device, "Chameleon")
-    all_results["chameleon_exp1_f3"] = run_exp1_f3(model, cham_loader, calib_loader, lpips_fn, device, "Chameleon")
+                # 计算 mask 误差
+                mean_l1, mean_cos, z_hats, used_masks = compute_masked_error(
+                    model, z, mratio, mtype, K, grid_size
+                )
 
-    # 保存
-    save_path = os.path.join(exp_dir, "eval_results.json")
-    with open(save_path, "w", encoding="utf-8") as f:
+                # 计算 base 误差
+                base_l1, base_cos = compute_base_error(model, z, grid_size)
+
+                # S_logratio (L1 版本)
+                s_lr_l1 = np.log((mean_l1 + tau_l1) / (base_l1 + tau_l1))
+                scores_logratio_l1.append(s_lr_l1)
+
+                # S_logratio (cosine 版本, tau 用同一个量级)
+                tau_cos = tau_l1 * 0.1  # cosine 误差量级不同, 适当缩放
+                s_lr_cos = np.log((mean_cos + tau_cos) / (base_cos + tau_cos))
+                scores_logratio_cos.append(s_lr_cos)
+
+                # S_var (使用与预测时完全相同的 mask)
+                if len(z_hats) >= 2:
+                    s_var = compute_s_var(z_hats, used_masks, grid_size)
+                else:
+                    s_var = 0.0
+                scores_var.append(s_var)
+
+                labels.append(label.item())
+
+                # 复杂度特征
+                cf = compute_complexity_features(x)
+                complexity_feats.append(cf)
+
+            labels = np.array(labels)
+            scores_l1 = np.array(scores_logratio_l1)
+            scores_cos = np.array(scores_logratio_cos)
+            s_vars = np.array(scores_var)
+
+            # AUROC / AUPR
+            try:
+                auroc_l1 = roc_auc_score(labels, scores_l1)
+                aupr_l1 = average_precision_score(labels, scores_l1)
+            except ValueError:
+                auroc_l1 = aupr_l1 = float("nan")
+
+            try:
+                auroc_cos = roc_auc_score(labels, scores_cos)
+                aupr_cos = average_precision_score(labels, scores_cos)
+            except ValueError:
+                auroc_cos = aupr_cos = float("nan")
+
+            log(f"  S_logratio(L1):  AUROC={auroc_l1:.4f}, AUPR={aupr_l1:.4f}", log_file)
+            log(f"  S_logratio(cos): AUROC={auroc_cos:.4f}, AUPR={aupr_cos:.4f}", log_file)
+            log(f"  S_var 均值: real={s_vars[labels == 0].mean():.6f}, "
+                f"fake={s_vars[labels == 1].mean():.6f}", log_file)
+
+            # 复杂度相关性分析
+            cf_keys = ["edge_density", "hf_energy", "patch_entropy", "grad_energy"]
+            for key in cf_keys:
+                vals = np.array([cf[key] for cf in complexity_feats])
+                if np.std(vals) > 1e-10 and np.std(scores_l1) > 1e-10:
+                    corr, pval = pearsonr(vals, scores_l1)
+                    log(f"  {key} vs S_logratio(L1): r={corr:.4f}, p={pval:.4f}", log_file)
+
+            all_results[condition] = {
+                "auroc_l1": float(auroc_l1),
+                "aupr_l1": float(aupr_l1),
+                "auroc_cos": float(auroc_cos),
+                "aupr_cos": float(aupr_cos),
+                "s_var_real_mean": float(s_vars[labels == 0].mean()),
+                "s_var_fake_mean": float(s_vars[labels == 1].mean()),
+                "tau_l1": float(tau_l1),
+                "K": K,
+            }
+
+    # 保存结果
+    result_path = os.path.join(eval_dir, f"eval_results_K{K}.json")
+    with open(result_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
-    print(f"\n结果保存到 {save_path}", flush=True)
-
-    return all_results
-
-
-def print_comparison(all_model_results):
-    """打印多个模型的 f3 AUROC 对比表"""
-    print(f"\n{'='*90}", flush=True)
-    print("模型对比: f3_pca_truncate AUROC", flush=True)
-    print(f"{'='*90}", flush=True)
-
-    keep_ratios = ["kr0.9", "kr0.7", "kr0.5", "kr0.3", "kr0.1"]
-
-    # GenImage
-    print(f"\n--- GenImage (源域) ---")
-    header = f"{'Mode':<8}"
-    for kr in keep_ratios:
-        header += f" {kr:>8}"
-    print(header)
-    print("-" * 55)
-    for mode, results in all_model_results.items():
-        if results is None or "genimage_exp1_f3" not in results:
-            continue
-        row = f"{mode:<8}"
-        for kr in keep_ratios:
-            auroc = results["genimage_exp1_f3"].get(kr, {}).get("auroc", 0)
-            row += f" {auroc:8.4f}"
-        print(row)
-
-    # Chameleon
-    print(f"\n--- Chameleon (zero-shot) ---")
-    print(header)
-    print("-" * 55)
-    for mode, results in all_model_results.items():
-        if results is None or "chameleon_exp1_f3" not in results:
-            continue
-        row = f"{mode:<8}"
-        for kr in keep_ratios:
-            auroc = results["chameleon_exp1_f3"].get(kr, {}).get("auroc", 0)
-            row += f" {auroc:8.4f}"
-        print(row)
-
-    print(f"{'='*90}")
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, required=True,
-                        help="A0, A1, A2, A3, or 'all'")
-    args = parser.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lpips_fn = load_lpips_vgg(device)
-    freq_fn = FreqLoss().to(device)
-
-    if args.mode == "all":
-        modes = ["A0", "A1", "A2", "A3"]
-    else:
-        modes = [args.mode]
-
-    all_model_results = {}
-    for mode in modes:
-        result = evaluate_one_model(mode, device, lpips_fn, freq_fn)
-        all_model_results[mode] = result
-
-    if len(all_model_results) > 1:
-        print_comparison(all_model_results)
+    log(f"\n结果已保存到: {result_path}", log_file)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Latent MAE Zero-Shot 评估")
+    parser.add_argument("--exp_name", type=str, default="A0",
+                        help="实验名称")
+    parser.add_argument("--K", type=int, default=config.EVAL_K,
+                        help="每张图的探测次数")
+    args = parser.parse_args()
+    evaluate(args)
