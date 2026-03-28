@@ -11,7 +11,7 @@ from scipy.stats import pearsonr
 from tqdm import tqdm
 
 import config
-from dataset import ChameleonTestDataset, RealPatchDataset
+from dataset import ChameleonTestDataset, RealPatchDataset  # 5090版本支持 preload
 from model import LatentMAE, sample_mask
 
 
@@ -288,7 +288,9 @@ def evaluate(args):
     batch_size = getattr(config, "EVAL_BATCH_SIZE", 32)
     num_workers = getattr(config, "EVAL_NUM_WORKERS", 4)
     
-    ds_test = ChameleonTestDataset()
+    # RAM 预加载
+    log("预加载图像到 RAM...", log_file)
+    ds_test = ChameleonTestDataset(preload=True, num_threads=16)
     dl_test = DataLoader(
         ds_test, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True,
@@ -301,7 +303,7 @@ def evaluate(args):
     log(f"测试集编码完成: {len(test_latents)} batches", log_file)
 
     # 批量编码验证集
-    ds_val = RealPatchDataset(patches_per_image=1, split="val")
+    ds_val = RealPatchDataset(patches_per_image=1, split="val", preload=True, num_threads=16)
     dl_val = DataLoader(ds_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     val_latents, _, _ = batch_encode(model, dl_val, device, "编码验证集")
     log(f"验证集编码完成: {len(val_latents)} batches", log_file)
