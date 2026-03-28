@@ -116,6 +116,63 @@ class Decoder(nn.Module):
 
 
 # ============================================================
+#  辅助头: H_s (结构) 和 H_d (细节)
+# ============================================================
+
+class StructHead(nn.Module):
+    """
+    结构辅助头 H_s: Z_s (16x16x32) -> X_low (256x256x3)
+    输入只有前 32 通道, 重建低频结构图
+    """
+    def __init__(self, struct_channels=32, out_channels=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(struct_channels, 64 * 4, 3, padding=1),
+            nn.PixelShuffle(2),  # 16->32
+            nn.GELU(),
+            nn.Conv2d(64, 64 * 4, 3, padding=1),
+            nn.PixelShuffle(2),  # 32->64
+            nn.GELU(),
+            nn.Conv2d(64, 32 * 4, 3, padding=1),
+            nn.PixelShuffle(2),  # 64->128
+            nn.GELU(),
+            nn.Conv2d(32, out_channels * 4, 3, padding=1),
+            nn.PixelShuffle(2),  # 128->256
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z_s):
+        return self.net(z_s)
+
+
+class DetailHead(nn.Module):
+    """
+    细节辅助头 H_d: Z_d (16x16x96) -> X_detail (256x256x3)
+    输入只有后 96 通道, 重建细节残差 (X - X_low)
+    注意: 输出不用 sigmoid, 直接输出实值残差
+    """
+    def __init__(self, detail_channels=96, out_channels=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(detail_channels, 96 * 4, 3, padding=1),
+            nn.PixelShuffle(2),  # 16->32
+            nn.GELU(),
+            nn.Conv2d(96, 64 * 4, 3, padding=1),
+            nn.PixelShuffle(2),  # 32->64
+            nn.GELU(),
+            nn.Conv2d(64, 32 * 4, 3, padding=1),
+            nn.PixelShuffle(2),  # 64->128
+            nn.GELU(),
+            nn.Conv2d(32, out_channels * 4, 3, padding=1),
+            nn.PixelShuffle(2),  # 128->256
+            # 不用 sigmoid, 直接输出实值残差
+        )
+
+    def forward(self, z_d):
+        return self.net(z_d)
+
+
+# ============================================================
 #  2D 正弦-余弦位置编码
 # ============================================================
 
@@ -309,14 +366,25 @@ class Predictor(nn.Module):
 
 class LatentMAE(nn.Module):
     """
-    两阶段 Latent MAE 模型
-    阶段一: E + D (AE 预训练)
+    两阶段 Latent MAE 模型 (Structure-Aware)
+    阶段一: E + D + H_s + H_d (AE 预训练, 结构/细节解耦)
     阶段二: P (masked latent completion), E/D 冻结
+    
+    Z_s = Z[:, :32]   - 结构通道
+    Z_d = Z[:, 32:]   - 细节通道
     """
     def __init__(self, latent_channels=128):
         super().__init__()
+        self.struct_channels = config.STRUCT_CHANNELS  # 32
+        self.detail_channels = config.DETAIL_CHANNELS  # 96
+        
         self.encoder = Encoder(latent_channels=latent_channels)
         self.decoder = Decoder(latent_channels=latent_channels)
+        
+        # 辅助头 (Stage1 结构/细节解耦监督)
+        self.struct_head = StructHead(struct_channels=self.struct_channels)
+        self.detail_head = DetailHead(detail_channels=self.detail_channels)
+        
         self.predictor = Predictor(
             embed_dim=latent_channels,
             num_layers=config.PRED_NUM_LAYERS,
@@ -335,11 +403,26 @@ class LatentMAE(nn.Module):
     def predict(self, z, mask):
         return self.predictor(z, mask)
 
+    def split_latent(self, z):
+        """将 latent 分离为结构/细节通道"""
+        z_s = z[:, :self.struct_channels]   # [B, 32, H, W]
+        z_d = z[:, self.struct_channels:]   # [B, 96, H, W]
+        return z_s, z_d
+
     def forward_stage1(self, x):
-        """阶段一前向: AE 重建"""
+        """
+        阶段一前向: AE 重建 + 结构/细节辅助输出
+        返回: x_recon, z, x_struct, x_detail
+        """
         z = self.encode(x)
         x_recon = self.decode(z)
-        return x_recon, z
+        
+        # 结构/细节辅助头
+        z_s, z_d = self.split_latent(z)
+        x_struct = self.struct_head(z_s)   # Z_s -> X_low 重建
+        x_detail = self.detail_head(z_d)   # Z_d -> 细节残差重建
+        
+        return x_recon, z, x_struct, x_detail
 
     def forward_stage2(self, x, mask):
         """
@@ -354,19 +437,29 @@ class LatentMAE(nn.Module):
         return z, z_hat
 
     def freeze_ae(self):
-        """冻结 Encoder 和 Decoder"""
+        """冻结 Encoder 和 Decoder (含辅助头)"""
         for p in self.encoder.parameters():
             p.requires_grad = False
         for p in self.decoder.parameters():
+            p.requires_grad = False
+        for p in self.struct_head.parameters():
+            p.requires_grad = False
+        for p in self.detail_head.parameters():
             p.requires_grad = False
         self.encoder.eval()
         self.decoder.eval()
+        self.struct_head.eval()
+        self.detail_head.eval()
 
     def unfreeze_ae(self):
-        """解冻 Encoder 和 Decoder"""
+        """解冻 Encoder 和 Decoder (含辅助头)"""
         for p in self.encoder.parameters():
             p.requires_grad = True
         for p in self.decoder.parameters():
+            p.requires_grad = True
+        for p in self.struct_head.parameters():
+            p.requires_grad = True
+        for p in self.detail_head.parameters():
             p.requires_grad = True
 
 
@@ -375,8 +468,11 @@ if __name__ == "__main__":
     x = torch.randn(2, 3, 256, 256)
 
     # 阶段一测试
-    x_recon, z = model.forward_stage1(x)
+    x_recon, z, x_struct, x_detail = model.forward_stage1(x)
+    z_s, z_d = model.split_latent(z)
     print(f"[阶段一] 输入: {x.shape}, Latent: {z.shape}, 重建: {x_recon.shape}")
+    print(f"  Z_s: {z_s.shape}, Z_d: {z_d.shape}")
+    print(f"  X_struct: {x_struct.shape}, X_detail: {x_detail.shape}")
 
     # 阶段二测试
     B = x.shape[0]

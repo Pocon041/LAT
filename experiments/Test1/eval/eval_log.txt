@@ -1,0 +1,110 @@
+设备: cuda
+--- 评估条件: random_30%, K=8 ---
+random_30%: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 26033/26033 [12:10<00:00, 35.63it/s]
+  实际 mask 比例均值: 0.2969 (目标 0.30)
+  S_logratio(L1):  AUROC=0.5234, AUPR=0.4439
+  S_logratio(cos): AUROC=0.5255, AUPR=0.4418
+  S_var 均值: real=0.011412, fake=0.017520
+  edge_density vs S_logratio(L1): r=0.0034, p=0.5839
+  hf_energy vs S_logratio(L1): r=-0.0186, p=0.0026
+  patch_entropy vs S_logratio(L1): r=0.0315, p=0.0000
+  grad_energy vs S_logratio(L1): r=0.0084, p=0.1730
+
+--- 评估条件: random_40%, K=8 ---
+random_40%: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 26033/26033 [12:53<00:00, 33.65it/s]
+  实际 mask 比例均值: 0.3984 (目标 0.40)
+  S_logratio(L1):  AUROC=0.5353, AUPR=0.4537
+  S_logratio(cos): AUROC=0.5409, AUPR=0.4544
+  S_var 均值: real=0.014925, fake=0.022906
+  edge_density vs S_logratio(L1): r=0.0030, p=0.6284
+  hf_energy vs S_logratio(L1): r=-0.0298, p=0.0000
+  patch_entropy vs S_logratio(L1): r=0.0431, p=0.0000
+  grad_energy vs S_logratio(L1): r=0.0113, p=0.0679
+
+--- 评估条件: random_50%, K=8 ---
+random_50%: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 26033/26033 [13:27<00:00, 32.26it/s]
+  实际 mask 比例均值: 0.5000 (目标 0.50)
+  S_logratio(L1):  AUROC=0.5474, AUPR=0.4636
+  S_logratio(cos): AUROC=0.5579, AUPR=0.4685
+  S_var 均值: real=0.018394, fake=0.027931
+  edge_density vs S_logratio(L1): r=-0.0012, p=0.8508
+  hf_energy vs S_logratio(L1): r=-0.0449, p=0.0000
+  patch_entropy vs S_logratio(L1): r=0.0537, p=0.0000
+  grad_energy vs S_logratio(L1): r=0.0103, p=0.0971
+
+--- 评估条件: random_60%, K=8 ---
+random_60%: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 26033/26033 [14:14<00:00, 30.48it/s]
+  实际 mask 比例均值: 0.5977 (目标 0.60)
+  S_logratio(L1):  AUROC=0.5623, AUPR=0.4748
+  S_logratio(cos): AUROC=0.5775, AUPR=0.4837
+  S_var 均值: real=0.021755, fake=0.032638
+  edge_density vs S_logratio(L1): r=-0.0077, p=0.2115
+  hf_energy vs S_logratio(L1): r=-0.0577, p=0.0000
+  patch_entropy vs S_logratio(L1): r=0.0607, p=0.0000
+  grad_energy vs S_logratio(L1): r=0.0099, p=0.1106
+
+--- 评估条件: random_70%, K=8 ---
+random_70%: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 26033/26033 [14:06<00:00, 30.76it/s]
+  实际 mask 比例均值: 0.6992 (目标 0.70)
+  S_logratio(L1):  AUROC=0.5783, AUPR=0.4872
+  S_logratio(cos): AUROC=0.6003, AUPR=0.5028
+  S_var 均值: real=0.025329, fake=0.037178
+  edge_density vs S_logratio(L1): r=-0.0263, p=0.0000
+  hf_energy vs S_logratio(L1): r=-0.0804, p=0.0000
+  patch_entropy vs S_logratio(L1): r=0.0595, p=0.0000
+  grad_energy vs S_logratio(L1): r=0.0012, p=0.8406
+
+--- 评估条件: block_30%, K=8 ---
+block_30%: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 26033/26033 [11:36<00:00, 37.36it/s]
+  实际 mask 比例均值: 0.2981 (目标 0.30)
+  S_logratio(L1):  AUROC=0.4997, AUPR=0.4175
+  S_logratio(cos): AUROC=0.5133, AUPR=0.4235
+  S_var 均值: real=0.031664, fake=0.043043
+  edge_density vs S_logratio(L1): r=-0.1041, p=0.0000
+  hf_energy vs S_logratio(L1): r=-0.0425, p=0.0000
+  patch_entropy vs S_logratio(L1): r=-0.1225, p=0.0000
+  grad_energy vs S_logratio(L1): r=-0.0498, p=0.0000
+
+--- 评估条件: block_40%, K=8 ---
+block_40%: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 26033/26033 [12:20<00:00, 35.17it/s]
+  实际 mask 比例均值: 0.3910 (目标 0.40)
+  S_logratio(L1):  AUROC=0.5062, AUPR=0.4214
+  S_logratio(cos): AUROC=0.5241, AUPR=0.4307
+  S_var 均值: real=0.035676, fake=0.047646
+  edge_density vs S_logratio(L1): r=-0.1133, p=0.0000
+  hf_energy vs S_logratio(L1): r=-0.0529, p=0.0000
+  patch_entropy vs S_logratio(L1): r=-0.1231, p=0.0000
+  grad_energy vs S_logratio(L1): r=-0.0576, p=0.0000
+
+--- 评估条件: block_50%, K=8 ---
+block_50%: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 26033/26033 [13:01<00:00, 33.33it/s]
+  实际 mask 比例均值: 0.5080 (目标 0.50)
+  S_logratio(L1):  AUROC=0.5158, AUPR=0.4270
+  S_logratio(cos): AUROC=0.5396, AUPR=0.4418
+  S_var 均值: real=0.042844, fake=0.055480
+  edge_density vs S_logratio(L1): r=-0.1309, p=0.0000
+  hf_energy vs S_logratio(L1): r=-0.0656, p=0.0000
+  patch_entropy vs S_logratio(L1): r=-0.1288, p=0.0000
+  grad_energy vs S_logratio(L1): r=-0.0722, p=0.0000
+
+--- 评估条件: block_60%, K=8 ---
+block_60%: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 26033/26033 [13:27<00:00, 32.23it/s]
+  实际 mask 比例均值: 0.6043 (目标 0.60)
+  S_logratio(L1):  AUROC=0.5253, AUPR=0.4338
+  S_logratio(cos): AUROC=0.5554, AUPR=0.4540
+  S_var 均值: real=0.050007, fake=0.062818
+  edge_density vs S_logratio(L1): r=-0.1455, p=0.0000
+  hf_energy vs S_logratio(L1): r=-0.0803, p=0.0000
+  patch_entropy vs S_logratio(L1): r=-0.1291, p=0.0000
+  grad_energy vs S_logratio(L1): r=-0.0858, p=0.0000
+
+--- 评估条件: block_70%, K=8 ---
+block_70%: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 26033/26033 [13:49<00:00, 31.38it/s]
+  实际 mask 比例均值: 0.6904 (目标 0.70)
+  S_logratio(L1):  AUROC=0.5287, AUPR=0.4358
+  S_logratio(cos): AUROC=0.5636, AUPR=0.4605
+  S_var 均值: real=0.056891, fake=0.067005
+  edge_density vs S_logratio(L1): r=-0.1575, p=0.0000
+  hf_energy vs S_logratio(L1): r=-0.0920, p=0.0000
+  patch_entropy vs S_logratio(L1): r=-0.1320, p=0.0000
+  grad_energy vs S_logratio(L1): r=-0.0958, p=0.0000

@@ -16,6 +16,10 @@ LATENT_CHANNELS = 128
 LATENT_SPATIAL = 16        # 16x16 网格
 NUM_TOKENS = LATENT_SPATIAL ** 2  # 256
 
+# 结构/细节通道分离 (DC-AE 思想)
+STRUCT_CHANNELS = 32       # Z_s: 前32通道 - 宏观结构
+DETAIL_CHANNELS = 96       # Z_d: 后96通道 - 高频纹理细节
+
 # Encoder (ConvNeXt 风格)
 ENCODER_DIMS = [64, 128, 256, 128]
 ENCODER_DEPTHS = [2, 2, 2, 2]
@@ -28,28 +32,44 @@ PRED_DROPOUT = 0.1
 
 # ---------- 掩码 ----------
 # 训练时 mask ratio 采样: 主体分布 + 辅助分布
-MASK_RATIOS_MAIN = [0.30, 0.50, 0.60]
-MASK_RATIOS_AUX = [0.05, 0.10]
+MASK_RATIOS_MAIN = [0.40, 0.60, 0.75]   # 主体分布: 学习空间因果推演
+MASK_RATIOS_AUX = [0.05, 0.10]           # 辅助分布: 防止分布偏移
 MASK_MAIN_PROB = 0.8   # 80% 概率从主体分布采样
 
 # 测试时 mask ratio sweep
-EVAL_MASK_RATIOS = [0.30, 0.40, 0.50, 0.60, 0.70]
+EVAL_MASK_RATIOS = [0.40, 0.50, 0.60, 0.70, 0.75]
 
 # ---------- 阶段一训练 ----------
 S1_BATCH_SIZE = 16
 S1_LR = 2e-4
 S1_EPOCHS = 200
 S1_NUM_WORKERS = 4
+# L_full-recon = L_pixel-L1 + λ_f * L_freq
 S1_LAMBDA_L1 = 1.0
 S1_LAMBDA_FREQ = 0.1
+# L_struct: 结构通道监督 (Z_s -> X_low)
+S1_LAMBDA_STRUCT = 0.5
+S1_STRUCT_L1_WEIGHT = 1.0
+S1_STRUCT_COS_WEIGHT = 0.2
+# L_detail: 细节通道监督 (Z_d -> X_detail)
+S1_LAMBDA_DETAIL = 0.1
+# X_low 生成: 高斯模糊核大小
+S1_BLUR_KERNEL_SIZE = 15
+S1_BLUR_SIGMA = 3.0
 
 # ---------- 阶段二训练 ----------
 S2_BATCH_SIZE = 16
 S2_LR = 1e-4
 S2_EPOCHS = 100
 S2_NUM_WORKERS = 4
-S2_LAMBDA_L1 = 1.0
-S2_LAMBDA_COS = 0.5
+# L_mask-struct (前32通道)
+S2_LAMBDA_STRUCT = 1.0
+S2_STRUCT_L1_WEIGHT = 1.0    # α_1
+S2_STRUCT_COS_WEIGHT = 0.3   # α_2
+# L_mask-detail (后96通道)
+S2_LAMBDA_DETAIL = 0.08
+S2_DETAIL_L1_WEIGHT = 1.0    # β_1
+S2_DETAIL_COS_WEIGHT = 0.3   # β_2
 
 # ---------- 评估 ----------
 EVAL_K = 8             # 默认探测次数
