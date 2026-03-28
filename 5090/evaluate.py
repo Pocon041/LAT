@@ -184,62 +184,83 @@ def compute_base_error_batch(model, z, grid_size, mask_type, struct_ch,
     z_repeat = z.expand(base_runs, -1, -1, -1)
     z_hats = model.predict(z_repeat, masks_tensor)
     
-    struct_l1_list, detail_l1_list = [], []
+    struct_l1_list, struct_cos_list = [], []
+    detail_l1_list, detail_cos_list = [], []
     
     for k in range(base_runs):
         m = masks_tensor[k]
         if m.sum() == 0:
             continue
-        s_l1, _, d_l1, _ = compute_channel_errors_batch(z, z_hats[k:k+1], m, struct_ch)
+        s_l1, s_cos, d_l1, d_cos = compute_channel_errors_batch(z, z_hats[k:k+1], m, struct_ch)
         struct_l1_list.append(s_l1)
+        struct_cos_list.append(s_cos)
         detail_l1_list.append(d_l1)
+        detail_cos_list.append(d_cos)
     
     return {
-        'struct': {'l1': np.mean(struct_l1_list) if struct_l1_list else 0.0},
-        'detail': {'l1': np.mean(detail_l1_list) if detail_l1_list else 0.0},
+        'struct': {
+            'l1': np.mean(struct_l1_list) if struct_l1_list else 0.0,
+            'cos': np.mean(struct_cos_list) if struct_cos_list else 0.0,
+        },
+        'detail': {
+            'l1': np.mean(detail_l1_list) if detail_l1_list else 0.0,
+            'cos': np.mean(detail_cos_list) if detail_cos_list else 0.0,
+        },
     }
 
 
 @torch.no_grad()
 def compute_s_var_channelwise(z_hats, masks, grid_size, struct_ch):
-    """计算分通道方差 (全 GPU)"""
+    """计算分通道方差 + 交叉方差 (全 GPU)"""
     if len(z_hats) < 2:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
     
     N = grid_size * grid_size
     device = z_hats[0].device
     
-    # 堆叠所有 z_hat: [K, N, C]
     z_stack = torch.cat([zh.flatten(2).permute(0, 2, 1) for zh in z_hats], dim=0)  # [K, N, C]
     mask_stack = torch.stack(masks)  # [K, N]
     
     struct_vars = []
     detail_vars = []
     total_vars = []
+    cross_covs = []  # 结构-细节协方差
     
     for i in range(N):
-        valid_k = mask_stack[:, i]  # [K] bool
+        valid_k = mask_stack[:, i]
         if valid_k.sum() < 2:
             continue
         
         preds = z_stack[valid_k, i, :]  # [K', C]
-        struct_vars.append(preds[:, :struct_ch].var(dim=0).mean().item())
-        detail_vars.append(preds[:, struct_ch:].var(dim=0).mean().item())
+        preds_s = preds[:, :struct_ch]  # [K', 32]
+        preds_d = preds[:, struct_ch:]  # [K', 96]
+        
+        struct_vars.append(preds_s.var(dim=0).mean().item())
+        detail_vars.append(preds_d.var(dim=0).mean().item())
         total_vars.append(preds.var(dim=0).mean().item())
+        
+        # 交叉协方差: 结构均值 vs 细节均值 的协方差
+        s_mean = preds_s.mean(dim=1)  # [K']
+        d_mean = preds_d.mean(dim=1)  # [K']
+        if s_mean.shape[0] >= 2:
+            cov = ((s_mean - s_mean.mean()) * (d_mean - d_mean.mean())).mean().abs().item()
+            cross_covs.append(cov)
     
     return (
         np.mean(struct_vars) if struct_vars else 0.0,
         np.mean(detail_vars) if detail_vars else 0.0,
         np.mean(total_vars) if total_vars else 0.0,
+        np.mean(cross_covs) if cross_covs else 0.0,
     )
 
 
 @torch.no_grad()
 def compute_complexity_features_batch(x):
-    """计算复杂度特征 (GPU)"""
+    """计算复杂度特征 (GPU): edge_density, hf_energy, grad_energy, patch_entropy"""
     gray = x[0].mean(dim=0)
     device = x.device
     
+    # Sobel 边缘
     sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
                            dtype=torch.float32, device=device).reshape(1, 1, 3, 3)
     sobel_y = sobel_x.permute(0, 1, 3, 2)
@@ -248,6 +269,7 @@ def compute_complexity_features_batch(x):
     gy = F.conv2d(g, sobel_y, padding=1)
     edge_density = (gx ** 2 + gy ** 2).sqrt().mean().item()
     
+    # 高频能量
     fft = torch.fft.rfft2(gray, norm="ortho")
     mag = fft.abs()
     H, W2 = mag.shape
@@ -261,10 +283,26 @@ def compute_complexity_features_batch(x):
     
     grad_energy = (gx ** 2 + gy ** 2).mean().item()
     
+    # Patch entropy: 将图像分成 16x16 块, 计算每块熵的均值
+    patch_size = 16
+    H_img, W_img = gray.shape
+    entropies = []
+    for i in range(0, H_img - patch_size + 1, patch_size):
+        for j in range(0, W_img - patch_size + 1, patch_size):
+            patch = gray[i:i+patch_size, j:j+patch_size]
+            # 量化到 256 bins
+            hist = torch.histc(patch, bins=256, min=0.0, max=1.0)
+            hist = hist / (hist.sum() + 1e-10)
+            hist = hist[hist > 0]
+            entropy = -(hist * torch.log2(hist)).sum().item()
+            entropies.append(entropy)
+    patch_entropy = np.mean(entropies) if entropies else 0.0
+    
     return {
         "edge_density": edge_density,
         "hf_energy": hf_energy,
         "grad_energy": grad_energy,
+        "patch_entropy": patch_entropy,
     }
 
 
@@ -318,22 +356,57 @@ def evaluate(args):
     mask_types = ["random", "block"]
     eval_ratios = config.EVAL_MASK_RATIOS
 
-    log("计算 tau (分通道, 批量)...", log_file)
-    tau_dict = {}
+    log("计算 tau (L1 + Cos + Var, 按 mtype+ratio 分别统计)...", log_file)
+    tau_dict = {}  # tau_dict[mtype][ratio] = {...}
+    
     for mtype in mask_types:
-        struct_l1_list, detail_l1_list = [], []
-        for i in tqdm(range(val_latents_flat.shape[0]), desc=f"tau[{mtype}]", leave=False):
+        tau_dict[mtype] = {}
+        
+        # L1/Cos tau: 从 base_error 统计 (与 ratio 无关, 只算一次)
+        struct_l1_list, struct_cos_list = [], []
+        detail_l1_list, detail_cos_list = [], []
+        
+        for i in tqdm(range(val_latents_flat.shape[0]), desc=f"tau_base[{mtype}]", leave=False):
             z = val_latents_flat[i:i+1]
             base_err = compute_base_error_batch(model, z, grid_size, mtype, struct_ch)
             struct_l1_list.append(base_err['struct']['l1'])
+            struct_cos_list.append(base_err['struct']['cos'])
             detail_l1_list.append(base_err['detail']['l1'])
+            detail_cos_list.append(base_err['detail']['cos'])
         
-        tau_dict[mtype] = {
+        tau_base = {
             'struct_l1': np.percentile(struct_l1_list, config.TAU_PERCENTILE),
+            'struct_cos': np.percentile(struct_cos_list, config.TAU_PERCENTILE),
             'detail_l1': np.percentile(detail_l1_list, config.TAU_PERCENTILE),
+            'detail_cos': np.percentile(detail_cos_list, config.TAU_PERCENTILE),
         }
-        log(f"  tau[{mtype}]: struct={tau_dict[mtype]['struct_l1']:.6f}, "
-            f"detail={tau_dict[mtype]['detail_l1']:.6f}", log_file)
+        log(f"  tau_base[{mtype}] L1: struct={tau_base['struct_l1']:.6f}, detail={tau_base['detail_l1']:.6f}", log_file)
+        log(f"  tau_base[{mtype}] Cos: struct={tau_base['struct_cos']:.6f}, detail={tau_base['detail_cos']:.6f}", log_file)
+        
+        # Var tau: 按每个 ratio 分别统计
+        for mratio in eval_ratios:
+            var_struct_list, var_detail_list, var_cross_list = [], [], []
+            
+            for i in tqdm(range(val_latents_flat.shape[0]), desc=f"tau_var[{mtype}][{int(mratio*100)}%]", leave=False):
+                z = val_latents_flat[i:i+1]
+                mask_err = compute_masked_error_batch(
+                    model, z, mratio, mtype, K, grid_size, struct_ch
+                )
+                s_var_s, s_var_d, _, s_var_cross = compute_s_var_channelwise(
+                    mask_err['z_hats'], mask_err['masks'], grid_size, struct_ch
+                )
+                var_struct_list.append(s_var_s)
+                var_detail_list.append(s_var_d)
+                var_cross_list.append(s_var_cross)
+            
+            tau_dict[mtype][mratio] = {
+                **tau_base,  # 继承 L1/Cos tau
+                'var_struct': np.percentile(var_struct_list, config.TAU_PERCENTILE),
+                'var_detail': np.percentile(var_detail_list, config.TAU_PERCENTILE),
+                'var_cross': np.percentile(var_cross_list, config.TAU_PERCENTILE),
+            }
+            log(f"  tau_var[{mtype}][{int(mratio*100)}%]: struct={tau_dict[mtype][mratio]['var_struct']:.6f}, "
+                f"detail={tau_dict[mtype][mratio]['var_detail']:.6f}", log_file)
 
     # 预计算 base_error (跨 ratio 复用)
     log("预计算测试集 base_error...", log_file)
@@ -359,9 +432,17 @@ def evaluate(args):
             condition = f"{mtype}_{int(mratio * 100)}%"
             log(f"\n--- 评估条件: {condition}, K={K} ---", log_file)
 
-            scores_struct, scores_detail, scores_couple = [], [], []
-            scores_var_struct, scores_var_detail, scores_var_total = [], [], []
+            # L1 分数
+            scores_struct_l1, scores_detail_l1 = [], []
+            # Cos 分数
+            scores_struct_cos, scores_detail_cos = [], []
+            # Var 分数
+            scores_var_struct, scores_var_detail, scores_var_total, scores_var_cross = [], [], [], []
+            # Couple
+            scores_couple = []
             actual_ratios_all = []
+
+            tau = tau_dict[mtype][mratio]  # 按 mtype + ratio 获取 tau
 
             for i in tqdm(range(test_latents_flat.shape[0]), desc=f"{condition}"):
                 z = test_latents_flat[i:i+1]
@@ -370,44 +451,61 @@ def evaluate(args):
                     model, z, mratio, mtype, K, grid_size, struct_ch
                 )
                 base_err = base_errors[mtype][i]
-                tau = tau_dict[mtype]
 
-                # S_struct
-                s_struct = np.log(
+                # S_struct_l1
+                s_struct_l1 = np.log(
                     (mask_err['struct']['l1'] + tau['struct_l1']) /
                     (base_err['struct']['l1'] + tau['struct_l1'])
                 )
-                scores_struct.append(s_struct)
+                scores_struct_l1.append(s_struct_l1)
 
-                # S_detail
-                s_detail = np.log(
+                # S_struct_cos
+                s_struct_cos = np.log(
+                    (mask_err['struct']['cos'] + tau['struct_cos']) /
+                    (base_err['struct']['cos'] + tau['struct_cos'])
+                )
+                scores_struct_cos.append(s_struct_cos)
+
+                # S_detail_l1
+                s_detail_l1 = np.log(
                     (mask_err['detail']['l1'] + tau['detail_l1']) /
                     (base_err['detail']['l1'] + tau['detail_l1'])
                 )
-                scores_detail.append(s_detail)
+                scores_detail_l1.append(s_detail_l1)
 
-                # S_var
-                s_var_s, s_var_d, s_var_t = compute_s_var_channelwise(
+                # S_detail_cos
+                s_detail_cos = np.log(
+                    (mask_err['detail']['cos'] + tau['detail_cos']) /
+                    (base_err['detail']['cos'] + tau['detail_cos'])
+                )
+                scores_detail_cos.append(s_detail_cos)
+
+                # S_var (分通道 + cross)
+                s_var_s, s_var_d, s_var_t, s_var_c = compute_s_var_channelwise(
                     mask_err['z_hats'], mask_err['masks'], grid_size, struct_ch
                 )
                 scores_var_struct.append(s_var_s)
                 scores_var_detail.append(s_var_d)
                 scores_var_total.append(s_var_t)
+                scores_var_cross.append(s_var_c)
 
-                # S_couple-lite
+                # S_couple-lite: 使用 var tau (量纲一致, 按 ratio 校准)
                 s_couple = np.log(
-                    (s_var_d + tau['detail_l1']) / (s_var_s + tau['struct_l1'] + 1e-10)
+                    (s_var_d + tau['var_detail']) / (s_var_s + tau['var_struct'] + 1e-10)
                 )
                 scores_couple.append(s_couple)
                 actual_ratios_all.append(mask_err['actual_ratio'])
 
             # 转换为数组
-            scores_struct = np.array(scores_struct)
-            scores_detail = np.array(scores_detail)
+            scores_struct_l1 = np.array(scores_struct_l1)
+            scores_struct_cos = np.array(scores_struct_cos)
+            scores_detail_l1 = np.array(scores_detail_l1)
+            scores_detail_cos = np.array(scores_detail_cos)
             scores_couple = np.array(scores_couple)
             s_var_struct_arr = np.array(scores_var_struct)
             s_var_detail_arr = np.array(scores_var_detail)
             s_var_total_arr = np.array(scores_var_total)
+            s_var_cross_arr = np.array(scores_var_cross)
             labels = test_labels_arr
 
             # AUROC / AUPR
@@ -417,52 +515,83 @@ def evaluate(args):
                 except:
                     return float("nan"), float("nan")
 
-            auroc_struct, aupr_struct = safe_auroc_aupr(labels, scores_struct)
-            auroc_detail, aupr_detail = safe_auroc_aupr(labels, scores_detail)
+            # L1 分数 AUROC/AUPR
+            auroc_struct_l1, aupr_struct_l1 = safe_auroc_aupr(labels, scores_struct_l1)
+            auroc_detail_l1, aupr_detail_l1 = safe_auroc_aupr(labels, scores_detail_l1)
+            # Cos 分数 AUROC/AUPR
+            auroc_struct_cos, aupr_struct_cos = safe_auroc_aupr(labels, scores_struct_cos)
+            auroc_detail_cos, aupr_detail_cos = safe_auroc_aupr(labels, scores_detail_cos)
+            # Couple + Var
             auroc_couple, aupr_couple = safe_auroc_aupr(labels, scores_couple)
             auroc_var_s, aupr_var_s = safe_auroc_aupr(labels, s_var_struct_arr)
             auroc_var_d, aupr_var_d = safe_auroc_aupr(labels, s_var_detail_arr)
             auroc_var_t, aupr_var_t = safe_auroc_aupr(labels, s_var_total_arr)
+            auroc_var_c, aupr_var_c = safe_auroc_aupr(labels, s_var_cross_arr)
 
             mean_act_ratio = np.mean(actual_ratios_all)
             log(f"  实际 mask 比例: {mean_act_ratio:.4f}", log_file)
-            log(f"  S_struct:      AUROC={auroc_struct:.4f}, AUPR={aupr_struct:.4f}", log_file)
-            log(f"  S_detail:      AUROC={auroc_detail:.4f}, AUPR={aupr_detail:.4f}", log_file)
+            log(f"  S_struct_l1:   AUROC={auroc_struct_l1:.4f}, AUPR={aupr_struct_l1:.4f}", log_file)
+            log(f"  S_struct_cos:  AUROC={auroc_struct_cos:.4f}, AUPR={aupr_struct_cos:.4f}", log_file)
+            log(f"  S_detail_l1:   AUROC={auroc_detail_l1:.4f}, AUPR={aupr_detail_l1:.4f}", log_file)
+            log(f"  S_detail_cos:  AUROC={auroc_detail_cos:.4f}, AUPR={aupr_detail_cos:.4f}", log_file)
             log(f"  S_couple-lite: AUROC={auroc_couple:.4f}, AUPR={aupr_couple:.4f}", log_file)
             log(f"  S_var_struct:  AUROC={auroc_var_s:.4f}, AUPR={aupr_var_s:.4f}", log_file)
             log(f"  S_var_detail:  AUROC={auroc_var_d:.4f}, AUPR={aupr_var_d:.4f}", log_file)
+            log(f"  S_var_cross:   AUROC={auroc_var_c:.4f}, AUPR={aupr_var_c:.4f}", log_file)
             log(f"  S_var (total): AUROC={auroc_var_t:.4f}, AUPR={aupr_var_t:.4f}", log_file)
 
             # 均值统计
-            log(f"  S_struct 均值: real={scores_struct[labels==0].mean():.6f}, fake={scores_struct[labels==1].mean():.6f}", log_file)
-            log(f"  S_detail 均值: real={scores_detail[labels==0].mean():.6f}, fake={scores_detail[labels==1].mean():.6f}", log_file)
+            log(f"  S_struct_l1 均值: real={scores_struct_l1[labels==0].mean():.6f}, fake={scores_struct_l1[labels==1].mean():.6f}", log_file)
+            log(f"  S_detail_l1 均值: real={scores_detail_l1[labels==0].mean():.6f}, fake={scores_detail_l1[labels==1].mean():.6f}", log_file)
 
-            # 复杂度相关性
-            for key in ["edge_density", "hf_energy", "grad_energy"]:
-                vals = np.array([cf[key] for cf in complexity_feats])
-                if np.std(vals) > 1e-10 and np.std(scores_struct) > 1e-10:
-                    corr, pval = pearsonr(vals, scores_struct)
-                    log(f"  {key} vs S_struct: r={corr:.4f}, p={pval:.4f}", log_file)
+            # 复杂度相关性 (扩展到多个分数)
+            complexity_keys = ["edge_density", "hf_energy", "grad_energy", "patch_entropy"]
+            score_dict = {
+                "S_struct_l1": scores_struct_l1,
+                "S_struct_cos": scores_struct_cos,
+                "S_detail_l1": scores_detail_l1,
+                "S_detail_cos": scores_detail_cos,
+                "S_couple": scores_couple,
+                "S_var_detail": s_var_detail_arr,
+            }
+            for ckey in complexity_keys:
+                vals = np.array([cf[ckey] for cf in complexity_feats])
+                if np.std(vals) < 1e-10:
+                    continue
+                for sname, sarr in score_dict.items():
+                    if np.std(sarr) > 1e-10:
+                        corr, pval = pearsonr(vals, sarr)
+                        log(f"  {ckey} vs {sname}: r={corr:.4f}, p={pval:.4f}", log_file)
 
             all_results[condition] = {
-                "auroc_struct": float(auroc_struct),
-                "aupr_struct": float(aupr_struct),
-                "auroc_detail": float(auroc_detail),
-                "aupr_detail": float(aupr_detail),
+                "auroc_struct_l1": float(auroc_struct_l1),
+                "aupr_struct_l1": float(aupr_struct_l1),
+                "auroc_struct_cos": float(auroc_struct_cos),
+                "aupr_struct_cos": float(aupr_struct_cos),
+                "auroc_detail_l1": float(auroc_detail_l1),
+                "aupr_detail_l1": float(aupr_detail_l1),
+                "auroc_detail_cos": float(auroc_detail_cos),
+                "aupr_detail_cos": float(aupr_detail_cos),
                 "auroc_couple": float(auroc_couple),
                 "aupr_couple": float(aupr_couple),
                 "auroc_var_struct": float(auroc_var_s),
                 "aupr_var_struct": float(aupr_var_s),
                 "auroc_var_detail": float(auroc_var_d),
                 "aupr_var_detail": float(aupr_var_d),
+                "auroc_var_cross": float(auroc_var_c),
+                "aupr_var_cross": float(aupr_var_c),
                 "auroc_var_total": float(auroc_var_t),
                 "aupr_var_total": float(aupr_var_t),
-                "s_struct_real_mean": float(scores_struct[labels==0].mean()),
-                "s_struct_fake_mean": float(scores_struct[labels==1].mean()),
-                "s_detail_real_mean": float(scores_detail[labels==0].mean()),
-                "s_detail_fake_mean": float(scores_detail[labels==1].mean()),
+                "s_struct_l1_real_mean": float(scores_struct_l1[labels==0].mean()),
+                "s_struct_l1_fake_mean": float(scores_struct_l1[labels==1].mean()),
+                "s_detail_l1_real_mean": float(scores_detail_l1[labels==0].mean()),
+                "s_detail_l1_fake_mean": float(scores_detail_l1[labels==1].mean()),
                 "tau_struct_l1": float(tau['struct_l1']),
+                "tau_struct_cos": float(tau['struct_cos']),
                 "tau_detail_l1": float(tau['detail_l1']),
+                "tau_detail_cos": float(tau['detail_cos']),
+                "tau_var_struct": float(tau['var_struct']),
+                "tau_var_detail": float(tau['var_detail']),
                 "actual_mask_ratio_mean": float(mean_act_ratio),
                 "K": K,
             }
