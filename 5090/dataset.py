@@ -1,120 +1,95 @@
 import os
-import random
+from concurrent.futures import ThreadPoolExecutor
+
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor
-import threading
 
 import config
 
 
-def _collect_images(folder, exts=(".png", ".jpg", ".jpeg")):
-    """收集文件夹下所有图像路径"""
+def collect_images(folder, exts=(".png", ".jpg", ".jpeg", ".bmp", ".webp")):
     paths = []
-    if not os.path.isdir(folder):
+    if folder is None or not os.path.isdir(folder):
         return paths
-    for fname in sorted(os.listdir(folder)):
-        if fname.lower().endswith(exts):
-            paths.append(os.path.join(folder, fname))
+    for name in sorted(os.listdir(folder)):
+        if name.lower().endswith(exts):
+            paths.append(os.path.join(folder, name))
     return paths
 
 
-def _resize_shorter_side(img, target_short=288):
-    """将图像短边 resize 到 target_short, 保持长宽比"""
+def resize_shorter_side(img, target_short=288):
     w, h = img.size
     short_side = min(w, h)
-    if short_side != target_short:
-        scale = target_short / short_side
-        img = img.resize((int(w * scale), int(h * scale)), Image.BICUBIC)
-    return img
-
-
-def _load_single_image(args):
-    """加载单张图像 (用于多线程)"""
-    path, resize_short = args
-    try:
-        img = Image.open(path).convert("RGB")
-        if resize_short:
-            img = _resize_shorter_side(img, target_short=resize_short)
+    if short_side == target_short:
         return img
-    except Exception as e:
-        print(f"加载失败: {path}, {e}")
-        return None
+    scale = target_short / short_side
+    return img.resize((int(round(w * scale)), int(round(h * scale))), Image.BICUBIC)
 
 
-def _preload_images(paths, resize_short=None, num_threads=16, desc="预加载"):
-    """多线程预加载图像到内存"""
-    print(f"[RAM预加载] {desc}: {len(paths)} 张图像, {num_threads} 线程")
-    
-    args_list = [(p, resize_short) for p in paths]
-    images = [None] * len(paths)
-    
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        results = list(tqdm(
-            executor.map(_load_single_image, args_list),
-            total=len(paths),
-            desc=desc
-        ))
-    
-    for i, img in enumerate(results):
-        images[i] = img
-    
-    valid_count = sum(1 for img in images if img is not None)
-    print(f"[RAM预加载] 完成: {valid_count}/{len(paths)} 张有效")
-    return images
+def ensure_min_size(img, min_size):
+    w, h = img.size
+    if w >= min_size and h >= min_size:
+        return img
+    scale = max(min_size / w, min_size / h) + 1e-3
+    return img.resize((int(round(w * scale)), int(round(h * scale))), Image.BICUBIC)
+
+
+def load_image_rgb(path):
+    with Image.open(path) as img:
+        return img.convert("RGB").copy()
+
+
+def preload_images(paths, desc):
+    if len(paths) == 0:
+        return []
+    print(f"[RAM预加载] 预加载 {desc}: {len(paths)} 张图像, {config.PRELOAD_NUM_WORKERS} 线程")
+    results = [None] * len(paths)
+    with ThreadPoolExecutor(max_workers=config.PRELOAD_NUM_WORKERS) as executor:
+        futures = {executor.submit(load_image_rgb, path): idx for idx, path in enumerate(paths)}
+        for future in tqdm(futures, total=len(futures), desc=f"预加载 {desc}"):
+            idx = futures[future]
+            results[idx] = future.result()
+    valid = sum(img is not None for img in results)
+    print(f"[RAM预加载] 完成: {valid}/{len(paths)} 张有效")
+    return results
 
 
 class RealPatchDataset(Dataset):
-    """
-    DIV2K + Flickr2K 真实图像数据集 (支持 RAM 预加载)
-    preload=True: 启动时加载所有图像到内存 (需要大内存)
-    """
-    def __init__(self, patches_per_image=8, split="train", preload=True, num_threads=16):
+    def __init__(self, split="train", patches_per_image=None, preload=None):
         super().__init__()
-        self.is_train = (split == "train")
-        self.preload = preload
+        self.split = split
+        self.is_train = split == "train"
+        self.patches_per_image = patches_per_image if patches_per_image is not None else config.PATCHES_PER_IMAGE
 
-        flickr_all = _collect_images(config.FLICKR2K_DIR)
-        flickr_split = len(flickr_all) - config.FLICKR2K_VAL_COUNT
+        flickr_all = collect_images(config.FLICKR2K_DIR)
+        flickr_split = max(0, len(flickr_all) - config.FLICKR2K_VAL_COUNT)
         flickr_train = flickr_all[:flickr_split]
         flickr_val = flickr_all[flickr_split:]
 
-        if split == "train":
-            self.paths = (
-                _collect_images(config.DIV2K_TRAIN_DIR)
-                + flickr_train
-            )
-            self.patches_per_image = patches_per_image
-        else:
-            self.paths = (
-                _collect_images(config.DIV2K_VAL_DIR)
-                + flickr_val
-            )
+        if self.is_train:
+            self.paths = collect_images(config.DIV2K_TRAIN_DIR) + flickr_train
+            if preload is None:
+                preload = config.TRAIN_PRELOAD_TO_RAM
+        elif split == "val":
+            self.paths = collect_images(config.DIV2K_VAL_DIR) + flickr_val
             self.patches_per_image = 1
-
-        # 预加载到内存
-        if preload:
-            resize_short = None if self.is_train else 288
-            self.images = _preload_images(
-                self.paths, 
-                resize_short=resize_short,
-                num_threads=num_threads,
-                desc=f"预加载 {split}"
-            )
+            if preload is None:
+                preload = config.VAL_PRELOAD_TO_RAM
         else:
-            self.images = None
+            raise ValueError(f"未知 split: {split}")
 
-        # 训练: 随机裁剪 + 数据增强
+        self.preload = preload
+        self.images = preload_images(self.paths, split) if self.preload else None
+
         self.train_transform = transforms.Compose([
             transforms.RandomCrop(config.IMG_SIZE),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
             transforms.ToTensor(),
         ])
-        # 验证: 确定性裁剪
-        self.val_transform = transforms.Compose([
+        self.eval_transform = transforms.Compose([
             transforms.CenterCrop(config.IMG_SIZE),
             transforms.ToTensor(),
         ])
@@ -122,54 +97,37 @@ class RealPatchDataset(Dataset):
     def __len__(self):
         return len(self.paths) * self.patches_per_image
 
+    def get_image(self, img_idx):
+        if self.images is not None:
+            return self.images[img_idx].copy()
+        return load_image_rgb(self.paths[img_idx])
+
     def __getitem__(self, idx):
         img_idx = idx // self.patches_per_image
-        
-        # 从内存或磁盘获取图像
-        if self.preload and self.images[img_idx] is not None:
-            img = self.images[img_idx].copy()  # 复制避免修改原图
-        else:
-            img = Image.open(self.paths[img_idx]).convert("RGB")
-
+        img = self.get_image(img_idx)
         if self.is_train:
-            w, h = img.size
-            if w < config.IMG_SIZE or h < config.IMG_SIZE:
-                scale = max(config.IMG_SIZE / w, config.IMG_SIZE / h) + 0.01
-                img = img.resize((int(w * scale), int(h * scale)), Image.BICUBIC)
+            img = ensure_min_size(img, config.IMG_SIZE)
             img = self.train_transform(img)
         else:
-            if not self.preload:
-                img = _resize_shorter_side(img, target_short=288)
-            img = self.val_transform(img)
+            img = resize_shorter_side(img, target_short=288)
+            img = ensure_min_size(img, config.IMG_SIZE)
+            img = self.eval_transform(img)
         return img
 
 
-class ChameleonTestDataset(Dataset):
-    """
-    Chameleon zero-shot 测试集 (支持 RAM 预加载)
-    """
-    def __init__(self, preload=True, num_threads=16):
+class FolderBinaryDataset(Dataset):
+    def __init__(self, real_dir, fake_dir, return_path=False, preload=False, desc="test"):
         super().__init__()
+        self.return_path = return_path
         self.items = []
+        for path in collect_images(real_dir):
+            self.items.append((path, 0))
+        for path in collect_images(fake_dir):
+            self.items.append((path, 1))
         self.preload = preload
-
-        for p in _collect_images(config.CHAMELEON_REAL_DIR):
-            self.items.append((p, 0))
-        for p in _collect_images(config.CHAMELEON_FAKE_DIR):
-            self.items.append((p, 1))
-
-        # 预加载到内存 (resize 到短边 288)
+        self.images = None
         if preload:
-            paths = [p for p, _ in self.items]
-            self.images = _preload_images(
-                paths, 
-                resize_short=288,
-                num_threads=num_threads,
-                desc="预加载 Chameleon"
-            )
-        else:
-            self.images = None
-
+            self.images = preload_images([path for path, _ in self.items], desc)
         self.transform = transforms.Compose([
             transforms.CenterCrop(config.IMG_SIZE),
             transforms.ToTensor(),
@@ -178,34 +136,42 @@ class ChameleonTestDataset(Dataset):
     def __len__(self):
         return len(self.items)
 
+    def get_image(self, idx):
+        if self.images is not None:
+            return self.images[idx].copy()
+        path, _ = self.items[idx]
+        return load_image_rgb(path)
+
     def __getitem__(self, idx):
         path, label = self.items[idx]
-        
-        if self.preload and self.images[idx] is not None:
-            img = self.images[idx]
-        else:
-            img = Image.open(path).convert("RGB")
-            img = _resize_shorter_side(img, target_short=288)
-        
+        img = self.get_image(idx)
+        img = resize_shorter_side(img, target_short=288)
+        img = ensure_min_size(img, config.IMG_SIZE)
         img = self.transform(img)
+        if self.return_path:
+            return img, label, path
         return img, label
 
 
-if __name__ == "__main__":
-    print("测试 RAM 预加载...")
-    ds_train = RealPatchDataset(split="train", preload=True, num_threads=16)
-    ds_val = RealPatchDataset(split="val", preload=True, num_threads=16)
-    ds_test = ChameleonTestDataset(preload=True, num_threads=16)
+class ChameleonTestDataset(FolderBinaryDataset):
+    def __init__(self, return_path=False, preload=None):
+        if preload is None:
+            preload = config.TEST_PRELOAD_TO_RAM
+        super().__init__(
+            config.CHAMELEON_REAL_DIR,
+            config.CHAMELEON_FAKE_DIR,
+            return_path=return_path,
+            preload=preload,
+            desc="test",
+        )
 
-    print(f"\n训练集: {len(ds_train.paths)} 张原图, {len(ds_train)} 个 patch")
-    print(f"验证集: {len(ds_val.paths)} 张原图, {len(ds_val)} 个 patch")
-    n_real = sum(1 for _, l in ds_test.items if l == 0)
-    n_fake = sum(1 for _, l in ds_test.items if l == 1)
-    print(f"Chameleon: real={n_real}, fake={n_fake}, 总计={len(ds_test)}")
-    
-    # 测试访问速度
-    import time
-    t0 = time.time()
-    for i in range(100):
-        _ = ds_train[i]
-    print(f"\n100 次访问耗时: {time.time() - t0:.3f}s")
+
+if __name__ == "__main__":
+    ds_train = RealPatchDataset(split="train")
+    ds_val = RealPatchDataset(split="val")
+    ds_test = ChameleonTestDataset()
+    print(f"train images={len(ds_train.paths)}, train patches={len(ds_train)}")
+    print(f"val images={len(ds_val.paths)}, val patches={len(ds_val)}")
+    n_real = sum(1 for _, y in ds_test.items if y == 0)
+    n_fake = sum(1 for _, y in ds_test.items if y == 1)
+    print(f"test real={n_real}, fake={n_fake}, total={len(ds_test)}")

@@ -1,172 +1,223 @@
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import math
 import random
 import argparse
-import torch
+
 import numpy as np
-from PIL import Image
-from torchvision import transforms
+import torch
 import matplotlib.pyplot as plt
 
 import config
-from model import LatentMAE
-from dataset import _collect_images, _resize_shorter_side
+from dataset import ChameleonTestDataset, RealPatchDataset
+from model import PixelMAE, sample_mask, patch_mask_to_pixel_mask, erode_pixel_mask
+from losses import laplacian_filter
 
 
-def load_ae(exp_dir, device):
-    """只加载 AE (Encoder + Decoder)"""
-    model = LatentMAE(latent_channels=config.LATENT_CHANNELS).to(device)
-    ae_path = os.path.join(exp_dir, "best_ae.pth")
-    ckpt = torch.load(ae_path, map_location=device, weights_only=True)
-    model.encoder.load_state_dict(ckpt["encoder"])
-    model.decoder.load_state_dict(ckpt["decoder"])
-    print(f"加载 AE: {ae_path} (epoch={ckpt['epoch']}, val_loss={ckpt['val_loss']:.6f})")
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def load_model(exp_dir, device):
+    model = PixelMAE().to(device)
+    best_path = os.path.join(exp_dir, "best_model.pth")
+    last_path = os.path.join(exp_dir, "last_model.pth")
+    ckpt_path = best_path if os.path.exists(best_path) else last_path
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"找不到模型权重: {best_path} 或 {last_path}")
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
     model.eval()
-    return model
+    return model, ckpt_path, ckpt.get("epoch", -1)
 
 
-def preprocess(img_path):
-    """与训练验证集一致的确定性预处理"""
-    img = Image.open(img_path).convert("RGB")
-    img = _resize_shorter_side(img, target_short=288)
-    transform = transforms.Compose([
-        transforms.CenterCrop(config.IMG_SIZE),
-        transforms.ToTensor(),
-    ])
-    return transform(img)
+def tensor_to_rgb(x):
+    arr = x.detach().cpu().permute(1, 2, 0).numpy()
+    return np.clip(arr, 0.0, 1.0)
+
+
+def to_heatmap(x, vmin=None, vmax=None):
+    arr = x.detach().cpu().numpy()
+    if vmin is None:
+        vmin = float(arr.min())
+    if vmax is None:
+        vmax = float(arr.max())
+    if math.isclose(vmax, vmin):
+        vmax = vmin + 1e-6
+    return arr, vmin, vmax
+
+
+def compute_error_maps(x, recon):
+    raw_map = (x - recon).abs().mean(dim=1, keepdim=True)
+    lap_x = laplacian_filter(x)
+    lap_r = laplacian_filter(recon)
+    hf_map = (lap_x - lap_r).abs().mean(dim=1, keepdim=True)
+    return raw_map, hf_map
+
+
+def sample_valid_mask(mask_type, mask_ratio, device):
+    for _ in range(config.MAX_MASK_SAMPLE_TRIES):
+        mask, actual_ratio = sample_mask(config.GRID_SIZE, mask_ratio, mask_type)
+        mask = mask.to(device)
+        pixel_mask = patch_mask_to_pixel_mask(mask, config.IMG_SIZE, config.PATCH_SIZE)
+        core_mask = erode_pixel_mask(pixel_mask.unsqueeze(0), config.CORE_EROSION_PX)[0]
+        if int(core_mask.sum().item()) >= config.CORE_MIN_PIXELS:
+            return mask, actual_ratio, pixel_mask, core_mask
+    raise RuntimeError(f"无法采到有效 mask: {mask_type}, {mask_ratio}")
 
 
 @torch.no_grad()
-def reconstruct(model, img_tensor, device):
-    """重构单张图像, 返回重构后的 tensor"""
-    x = img_tensor.unsqueeze(0).to(device)
-    x_recon, z = model.forward_stage1(x)
-    x_recon = x_recon.clamp(0, 1)
-    return x_recon[0].cpu()
+def collect_k_predictions(model, x, mask_type, mask_ratio, K):
+    recons = []
+    pred_fulls = []
+    raw_scores = []
+    hf_scores = []
+    core_masks = []
+    pixel_masks = []
+    ratios = []
+    for _ in range(K):
+        mask, actual_ratio, pixel_mask, core_mask = sample_valid_mask(mask_type, mask_ratio, x.device)
+        recon, pred_full, _, _ = model.reconstruct(x, mask.unsqueeze(0), copy_back=True)
+        raw_map, hf_map = compute_error_maps(x, recon)
+        core = core_mask.unsqueeze(0)
+        raw = (raw_map * core).sum() / core.sum().clamp_min(1.0)
+        hf = (hf_map * core).sum() / core.sum().clamp_min(1.0)
+        recons.append(recon)
+        pred_fulls.append(pred_full)
+        raw_scores.append(raw.item())
+        hf_scores.append(hf.item())
+        core_masks.append(core)
+        pixel_masks.append(pixel_mask.unsqueeze(0))
+        ratios.append(actual_ratio)
+    return {
+        "recons": recons,
+        "pred_fulls": pred_fulls,
+        "raw_scores": raw_scores,
+        "hf_scores": hf_scores,
+        "core_masks": core_masks,
+        "pixel_masks": pixel_masks,
+        "actual_ratios": ratios,
+    }
 
 
-def tensor_to_numpy(t):
-    """[C, H, W] tensor -> [H, W, C] numpy for matplotlib"""
-    return t.permute(1, 2, 0).numpy()
+@torch.no_grad()
+def compute_var_heatmap(recons, core_masks):
+    x_stack = torch.stack([r[0] for r in recons], dim=0)
+    m_stack = torch.stack([m[0] for m in core_masks], dim=0).float()
+    m_stack = m_stack.expand(-1, x_stack.shape[1], -1, -1)
+    count = m_stack.sum(dim=0)
+    valid = count >= 2.0
+    sum_x = (x_stack * m_stack).sum(dim=0)
+    sum_x2 = (x_stack.pow(2) * m_stack).sum(dim=0)
+    mean = sum_x / count.clamp_min(1.0)
+    var = sum_x2 / count.clamp_min(1.0) - mean.pow(2)
+    var = var.mean(dim=0, keepdim=True)
+    valid2d = valid.any(dim=0, keepdim=True)
+    var = var * valid2d.float()
+    return var
 
 
-def compute_residual(orig, recon):
-    """计算残差图 (放大显示)"""
-    diff = (orig - recon).abs()
-    # 放大 5 倍方便观察
-    diff = (diff * 5).clamp(0, 1)
-    return diff
+def get_dataset(split, return_path=False):
+    if split == "test":
+        return ChameleonTestDataset(return_path=return_path)
+    if split == "val":
+        class _ValDataset(RealPatchDataset):
+            def __getitem__(self, idx):
+                img = super().__getitem__(idx)
+                if return_path:
+                    path = self.paths[idx // self.patches_per_image]
+                    return img, 0, path
+                return img, 0
+        return _ValDataset(split="val", patches_per_image=1)
+    raise ValueError(f"未知 split: {split}")
 
 
 def visualize(args):
+    set_seed(config.SEED)
     exp_dir = os.path.join(config.EXP_DIR, args.exp_name)
-    out_dir = os.path.join(exp_dir, "vis_recon")
+    out_dir = os.path.join(exp_dir, "vis")
     os.makedirs(out_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_ae(exp_dir, device)
+    model, ckpt_path, epoch = load_model(exp_dir, device)
+    print(f"加载模型: {ckpt_path} (epoch={epoch})")
 
-    # 收集图像
-    real_paths = _collect_images(config.CHAMELEON_REAL_DIR)
-    fake_paths = _collect_images(config.CHAMELEON_FAKE_DIR)
-    val_paths = _collect_images(config.DIV2K_VAL_DIR)
+    dataset = get_dataset(args.split, return_path=True)
+    total = min(args.num_samples, len(dataset))
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    indices = indices[:total]
 
-    # 随机采样
-    random.seed(42)
-    n = args.num_samples
-    real_samples = random.sample(real_paths, min(n, len(real_paths)))
-    fake_samples = random.sample(fake_paths, min(n, len(fake_paths)))
-    val_samples = random.sample(val_paths, min(n, len(val_paths)))
+    for vis_idx, ds_idx in enumerate(indices):
+        x, label, path = dataset[ds_idx]
+        x = x.unsqueeze(0).to(device)
+        out = collect_k_predictions(model, x, args.mask_type, args.mask_ratio, args.K)
 
-    sources = [
-        ("real (Chameleon)", real_samples),
-        ("fake (Chameleon)", fake_samples),
-        ("val (DIV2K)", val_samples),
-    ]
+        recon = out["recons"][0]
+        pred_full = out["pred_fulls"][0]
+        pixel_mask = out["pixel_masks"][0]
+        core_mask = out["core_masks"][0]
+        raw_map, hf_map = compute_error_maps(x, recon)
+        var_map = compute_var_heatmap(out["recons"], out["core_masks"])
 
-    for src_name, paths in sources:
-        num = len(paths)
-        fig, axes = plt.subplots(num, 3, figsize=(12, 4 * num))
-        if num == 1:
-            axes = axes[np.newaxis, :]
+        raw_mean = float(np.mean(out["raw_scores"]))
+        hf_mean = float(np.mean(out["hf_scores"]))
+        ratio_mean = float(np.mean(out["actual_ratios"]))
 
-        fig.suptitle(f"AE Reconstruction: {src_name} ({args.exp_name})", fontsize=14, y=0.99)
+        fig, axes = plt.subplots(2, 4, figsize=(18, 9))
+        fig.suptitle(
+            f"{os.path.basename(path)} | label={label} | {args.mask_type}_{int(args.mask_ratio * 100)}% | "
+            f"K={args.K} | raw={raw_mean:.4f} | hf={hf_mean:.4f} | ratio={ratio_mean:.4f}",
+            fontsize=11,
+        )
 
-        for i, p in enumerate(paths):
-            orig = preprocess(p)
-            recon = reconstruct(model, orig, device)
-            residual = compute_residual(orig, recon)
+        axes[0, 0].imshow(tensor_to_rgb(x[0]))
+        axes[0, 0].set_title("Input")
+        axes[0, 1].imshow(tensor_to_rgb(pred_full[0]))
+        axes[0, 1].set_title("Decoder Pred (full)")
+        axes[0, 2].imshow(tensor_to_rgb(recon[0]))
+        axes[0, 2].set_title("Visible Copy-back")
+        axes[0, 3].imshow(pixel_mask[0, 0].detach().cpu().numpy(), cmap="gray")
+        axes[0, 3].set_title("Pixel Mask")
 
-            l1_err = (orig - recon).abs().mean().item()
+        raw_arr, raw_min, raw_max = to_heatmap(raw_map[0, 0])
+        hf_arr, hf_min, hf_max = to_heatmap(hf_map[0, 0])
+        var_arr, var_min, var_max = to_heatmap(var_map[0, 0])
+        core_arr = core_mask[0, 0].detach().cpu().numpy()
 
-            axes[i, 0].imshow(tensor_to_numpy(orig))
-            axes[i, 0].set_title("Original", fontsize=10)
-            axes[i, 0].axis("off")
+        im1 = axes[1, 0].imshow(core_arr, cmap="gray")
+        axes[1, 0].set_title("Masked Core")
+        im2 = axes[1, 1].imshow(raw_arr, cmap="magma", vmin=raw_min, vmax=raw_max)
+        axes[1, 1].set_title("Raw Error Map")
+        im3 = axes[1, 2].imshow(hf_arr, cmap="magma", vmin=hf_min, vmax=hf_max)
+        axes[1, 2].set_title("High-freq Error Map")
+        im4 = axes[1, 3].imshow(var_arr, cmap="viridis", vmin=var_min, vmax=var_max)
+        axes[1, 3].set_title("K-run Pixel Var")
 
-            axes[i, 1].imshow(tensor_to_numpy(recon))
-            axes[i, 1].set_title(f"Recon (L1={l1_err:.4f})", fontsize=10)
-            axes[i, 1].axis("off")
+        for ax in axes.flat:
+            ax.axis("off")
 
-            axes[i, 2].imshow(tensor_to_numpy(residual))
-            axes[i, 2].set_title("Residual (x5)", fontsize=10)
-            axes[i, 2].axis("off")
+        fig.colorbar(im2, ax=axes[1, 1], fraction=0.046, pad=0.04)
+        fig.colorbar(im3, ax=axes[1, 2], fraction=0.046, pad=0.04)
+        fig.colorbar(im4, ax=axes[1, 3], fraction=0.046, pad=0.04)
+        fig.tight_layout()
 
-        plt.tight_layout()
-        safe_name = src_name.replace(" ", "_").replace("(", "").replace(")", "")
-        save_path = os.path.join(out_dir, f"recon_{safe_name}.png")
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.close()
+        save_name = f"vis_{vis_idx:03d}_{os.path.splitext(os.path.basename(path))[0]}.png"
+        save_path = os.path.join(out_dir, save_name)
+        plt.savefig(save_path, dpi=160, bbox_inches="tight")
+        plt.close(fig)
         print(f"保存: {save_path}")
-
-    # 额外: 真假对比图 (同一张图里左 real 右 fake)
-    num_compare = min(n, len(real_samples), len(fake_samples))
-    fig, axes = plt.subplots(num_compare, 4, figsize=(16, 4 * num_compare))
-    if num_compare == 1:
-        axes = axes[np.newaxis, :]
-
-    fig.suptitle(f"Real vs Fake Reconstruction Comparison ({args.exp_name})", fontsize=14, y=0.99)
-
-    for i in range(num_compare):
-        real_orig = preprocess(real_samples[i])
-        real_recon = reconstruct(model, real_orig, device)
-        real_res = compute_residual(real_orig, real_recon)
-        real_l1 = (real_orig - real_recon).abs().mean().item()
-
-        fake_orig = preprocess(fake_samples[i])
-        fake_recon = reconstruct(model, fake_orig, device)
-        fake_res = compute_residual(fake_orig, fake_recon)
-        fake_l1 = (fake_orig - fake_recon).abs().mean().item()
-
-        axes[i, 0].imshow(tensor_to_numpy(real_orig))
-        axes[i, 0].set_title(f"Real (L1={real_l1:.4f})", fontsize=10)
-        axes[i, 0].axis("off")
-
-        axes[i, 1].imshow(tensor_to_numpy(real_res))
-        axes[i, 1].set_title("Real Residual (x5)", fontsize=10)
-        axes[i, 1].axis("off")
-
-        axes[i, 2].imshow(tensor_to_numpy(fake_orig))
-        axes[i, 2].set_title(f"Fake (L1={fake_l1:.4f})", fontsize=10)
-        axes[i, 2].axis("off")
-
-        axes[i, 3].imshow(tensor_to_numpy(fake_res))
-        axes[i, 3].set_title("Fake Residual (x5)", fontsize=10)
-        axes[i, 3].axis("off")
-
-    plt.tight_layout()
-    save_path = os.path.join(out_dir, "recon_real_vs_fake.png")
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"保存: {save_path}")
-
-    print(f"\n所有可视化已保存到: {out_dir}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AE 重构可视化")
-    parser.add_argument("--exp_name", type=str, default="Test1",
-                        help="实验名称")
-    parser.add_argument("--num_samples", type=int, default=4,
-                        help="每类采样数量")
+    parser = argparse.ArgumentParser(description="实验三重建与误差可视化")
+    parser.add_argument("--exp_name", type=str, default="Exp3_A0")
+    parser.add_argument("--split", type=str, default="test", choices=["test", "val"])
+    parser.add_argument("--mask_type", type=str, default="block", choices=["random", "block", "stripe"])
+    parser.add_argument("--mask_ratio", type=float, default=0.60)
+    parser.add_argument("--K", type=int, default=8)
+    parser.add_argument("--num_samples", type=int, default=8)
     args = parser.parse_args()
     visualize(args)

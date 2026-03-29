@@ -4,89 +4,99 @@ import os
 DIV2K_TRAIN_DIR = r"D:\PNG_Dataset\DIV2K_train_HR"
 DIV2K_VAL_DIR = r"D:\PNG_Dataset\DIV2K_valid_HR"
 FLICKR2K_DIR = r"D:\Flickr2K\Flickr2K_HR"
-FLICKR2K_VAL_COUNT = 200   # Flickr2K 尾部 200 张划给验证集
+FLICKR2K_VAL_COUNT = 200
 
-# Chameleon zero-shot 测试集
 CHAMELEON_REAL_DIR = r"D:\Chameleon\test\0_real"
 CHAMELEON_FAKE_DIR = r"D:\Chameleon\test\1_fake"
 
+CALIB_REAL_DIR = None
+CALIB_FAKE_DIR = None
+
 # ---------- 模型 ----------
 IMG_SIZE = 256
-LATENT_CHANNELS = 128
-LATENT_SPATIAL = 16        # 16x16 网格
-NUM_TOKENS = LATENT_SPATIAL ** 2  # 256
+IN_CHANNELS = 3
+PATCH_SIZE = 16
+GRID_SIZE = IMG_SIZE // PATCH_SIZE
+NUM_TOKENS = GRID_SIZE * GRID_SIZE
+PATCH_DIM = PATCH_SIZE * PATCH_SIZE * IN_CHANNELS
 
-# 结构/细节通道分离 (DC-AE 思想)
-STRUCT_CHANNELS = 32       # Z_s: 前32通道 - 宏观结构
-DETAIL_CHANNELS = 96       # Z_d: 后96通道 - 高频纹理细节
+ENC_EMBED_DIM = 384
+ENC_DEPTH = 12
+ENC_NUM_HEADS = 6
+ENC_MLP_RATIO = 4.0
+ENC_DROPOUT = 0.0
 
-# Encoder (ConvNeXt 风格)
-ENCODER_DIMS = [64, 128, 256, 128]
-ENCODER_DEPTHS = [2, 2, 2, 2]
-
-# Predictor (Transformer)
-PRED_NUM_LAYERS = 4
-PRED_NUM_HEADS = 8
-PRED_DIM_FFN = 512
-PRED_DROPOUT = 0.1
+DEC_EMBED_DIM = 256
+DEC_DEPTH = 4
+DEC_NUM_HEADS = 8
+DEC_MLP_RATIO = 4.0
+DEC_DROPOUT = 0.0
 
 # ---------- 掩码 ----------
-# 训练时 mask ratio 采样: 主体分布 + 辅助分布
-MASK_RATIOS_MAIN = [0.40, 0.60, 0.75]   # 主体分布: 学习空间因果推演
-MASK_RATIOS_AUX = [0.05, 0.10]           # 辅助分布: 防止分布偏移
-MASK_MAIN_PROB = 0.8   # 80% 概率从主体分布采样
+TRAIN_MASK_TYPES = ["random", "block"]
+TRAIN_MASK_TYPE_PROBS = [0.5, 0.5]
+TRAIN_MASK_RATIOS_MAIN = [0.40, 0.60, 0.75]
+TRAIN_MASK_RATIOS_AUX = [0.05, 0.10]
+TRAIN_MASK_MAIN_PROB = 0.8
 
-# 测试时 mask ratio sweep
+EVAL_MASK_TYPES = ["random", "block", "stripe"]
 EVAL_MASK_RATIOS = [0.40, 0.50, 0.60, 0.70, 0.75]
+EVAL_BASE_MASK_RATIO = 0.10
+EVAL_BASE_RUNS = 4
+EVAL_K = 8
+EVAL_K_LIST = [4, 8, 16]
+TAU_PERCENTILE = 5
+CORE_EROSION_PX = 8
+CORE_MIN_PIXELS = 256
+MAX_MASK_SAMPLE_TRIES = 2048
 
-# ---------- 5090 性能优化 ----------
-CUDNN_BENCHMARK = True     # cudnn.benchmark 自动选择最快算法
-PREFETCH_FACTOR = 4        # DataLoader 预取倍数
-PIN_MEMORY = True          # 锁页内存加速 GPU 传输
-PERSISTENT_WORKERS = True  # 保持 worker 进程存活
-COMPILE_MODEL = False      # torch.compile (实验性)
+# ---------- 数据 ----------
+PATCHES_PER_IMAGE = 12
+TRAIN_BATCH_SIZE = 64
+VAL_BATCH_SIZE = 64
+EVAL_BATCH_SIZE = 1
 
-# ---------- 阶段一训练 ----------
-S1_BATCH_SIZE = 48         # 5090 显存大, 可用更大 batch
-S1_LR = 3e-4               # 更大 batch 配合更高 lr
-S1_EPOCHS = 200
-S1_NUM_WORKERS = 12        # 90GB 内存, 多 worker 预加载
-# L_full-recon = L_pixel-L1 + λ_f * L_freq
-S1_LAMBDA_L1 = 1.0
-S1_LAMBDA_FREQ = 0.1
-# L_struct: 结构通道监督 (Z_s -> X_low)
-S1_LAMBDA_STRUCT = 0.5
-S1_STRUCT_L1_WEIGHT = 1.0
-S1_STRUCT_COS_WEIGHT = 0.2
-# L_detail: 细节通道监督 (Z_d -> X_detail)
-S1_LAMBDA_DETAIL = 0.1
-# X_low 生成: 高斯模糊核大小
-S1_BLUR_KERNEL_SIZE = 15
-S1_BLUR_SIGMA = 3.0
+TRAIN_NUM_WORKERS = 8
+VAL_NUM_WORKERS = 8
+EVAL_NUM_WORKERS = 4
+PIN_MEMORY = True
+PERSISTENT_WORKERS = True
+PREFETCH_FACTOR = 4
 
-# ---------- 阶段二训练 ----------
-S2_BATCH_SIZE = 64         # Predictor 更轻量, batch 可更大
-S2_LR = 2e-4
-S2_EPOCHS = 100
-S2_NUM_WORKERS = 12
-# L_mask-struct (前32通道)
-S2_LAMBDA_STRUCT = 1.0
-S2_STRUCT_L1_WEIGHT = 1.0    # α_1
-S2_STRUCT_COS_WEIGHT = 0.3   # α_2
-# L_mask-detail (后96通道)
-S2_LAMBDA_DETAIL = 0.08
-S2_DETAIL_L1_WEIGHT = 1.0    # β_1
-S2_DETAIL_COS_WEIGHT = 0.3   # β_2
+TRAIN_PRELOAD_TO_RAM = True
+VAL_PRELOAD_TO_RAM = True
+TEST_PRELOAD_TO_RAM = True
+PRELOAD_NUM_WORKERS = 8
+
+# ---------- 训练 ----------
+EPOCHS = 200
+LR = 1e-4
+WEIGHT_DECAY = 0.05
+GRAD_CLIP = 1.0
+WARMUP_EPOCHS = 10
+
+LAMBDA_RAW = 1.0
+LAMBDA_LAP = 0.5
+
+VAL_PANEL = [
+    ("random", 0.40),
+    ("random", 0.60),
+    ("random", 0.75),
+    ("block", 0.60),
+]
+
+# ---------- 5090 优化 ----------
+SEED = 42
+ENABLE_TF32 = True
+ENABLE_CUDNN_BENCHMARK = True
+USE_CHANNELS_LAST = True
+ENABLE_TORCH_COMPILE = False
+MATMUL_PRECISION = "high"
 
 # ---------- 评估 ----------
-EVAL_K = 8             # 默认探测次数
-EVAL_K_LIST = [4, 8, 16]
-EVAL_BASE_MASK_RATIO = 0.05
-EVAL_BASE_RUNS = 3
-TAU_PERCENTILE = 5     # tau 取 Err_base 的 5% 分位数
-EVAL_BATCH_SIZE = 64   # 评估时批量编码
-EVAL_NUM_WORKERS = 8
+THRESHOLD_SEARCH_STEPS = 400
 
 # ---------- 输出 ----------
-EXP_DIR = r"D:\MAE_Test\experiments"
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+EXP_DIR = os.path.join(THIS_DIR, "experiments")
 os.makedirs(EXP_DIR, exist_ok=True)

@@ -1,403 +1,284 @@
 import os
-os.environ["OMP_NUM_THREADS"] = "4"
-import time
+import math
+import json
+import random
 import argparse
+
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import kornia
 
 import config
 from dataset import RealPatchDataset
-from model import LatentMAE, sample_train_mask, sample_mask
-from losses import Stage1Loss, Stage2Loss
-
-
-def setup_cuda_optimizations():
-    """设置 CUDA 优化"""
-    if torch.cuda.is_available():
-        if getattr(config, "CUDNN_BENCHMARK", False):
-            torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        print(f"CUDA 优化: benchmark={torch.backends.cudnn.benchmark}, TF32=True")
-
-
-def get_dataloader(dataset, batch_size, shuffle, num_workers):
-    """创建优化的 DataLoader"""
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=getattr(config, "PIN_MEMORY", True),
-        prefetch_factor=getattr(config, "PREFETCH_FACTOR", 2),
-        persistent_workers=getattr(config, "PERSISTENT_WORKERS", False) and num_workers > 0,
-        drop_last=shuffle,
-    )
-
-
-def get_gaussian_blur(kernel_size, sigma):
-    """创建高斯模糊层, 用于生成 X_low"""
-    return kornia.filters.GaussianBlur2d(
-        (kernel_size, kernel_size), (sigma, sigma)
-    )
+from model import PixelMAE, batch_sample_train_masks, batch_sample_masks, patch_mask_to_pixel_mask
+from losses import PixelReconstructionLoss
 
 
 def log(msg, log_file=None):
     print(msg)
-    if log_file:
+    if log_file is not None:
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
 
 
-# ============================================================
-#  阶段一: AE 预训练 (E + D)
-# ============================================================
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-def train_stage1(args):
-    exp_dir = os.path.join(config.EXP_DIR, args.exp_name)
-    os.makedirs(exp_dir, exist_ok=True)
-    log_file = os.path.join(exp_dir, "train_log.txt")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    setup_cuda_optimizations()
-    log(f"[阶段一] 设备: {device}, batch_size={config.S1_BATCH_SIZE}", log_file)
+def configure_backend():
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision(config.MATMUL_PRECISION)
+    if config.ENABLE_CUDNN_BENCHMARK:
+        torch.backends.cudnn.benchmark = True
+    if config.ENABLE_TF32 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
-    # 数据 (RAM 预加载 + 优化 DataLoader)
-    log("预加载图像到 RAM...", log_file)
-    ds_train = RealPatchDataset(patches_per_image=8, split="train", preload=True, num_threads=16)
-    ds_val = RealPatchDataset(split="val", preload=True, num_threads=16)
-    dl_train = get_dataloader(ds_train, config.S1_BATCH_SIZE, shuffle=True, num_workers=config.S1_NUM_WORKERS)
-    dl_val = get_dataloader(ds_val, config.S1_BATCH_SIZE, shuffle=False, num_workers=config.S1_NUM_WORKERS)
-    log(f"训练集: {len(ds_train)} patches, 验证集: {len(ds_val)} patches", log_file)
-    log(f"DataLoader: workers={config.S1_NUM_WORKERS}, prefetch={getattr(config, 'PREFETCH_FACTOR', 2)}", log_file)
 
-    # 高斯模糊层: 生成 X_low
-    blur = get_gaussian_blur(
-        config.S1_BLUR_KERNEL_SIZE, config.S1_BLUR_SIGMA
-    ).to(device)
-    log(f"高斯模糊: kernel={config.S1_BLUR_KERNEL_SIZE}, sigma={config.S1_BLUR_SIGMA}", log_file)
+def move_to_device(x, device):
+    x = x.to(device, non_blocking=True)
+    if config.USE_CHANNELS_LAST:
+        x = x.contiguous(memory_format=torch.channels_last)
+    return x
 
-    # 模型
-    model = LatentMAE(latent_channels=config.LATENT_CHANNELS).to(device)
-    criterion = Stage1Loss(
-        lambda_l1=config.S1_LAMBDA_L1,
-        lambda_freq=config.S1_LAMBDA_FREQ,
-        lambda_struct=config.S1_LAMBDA_STRUCT,
-        struct_l1_weight=config.S1_STRUCT_L1_WEIGHT,
-        struct_cos_weight=config.S1_STRUCT_COS_WEIGHT,
-        lambda_detail=config.S1_LAMBDA_DETAIL,
+
+def build_model(device):
+    model_raw = PixelMAE().to(device)
+    if config.USE_CHANNELS_LAST:
+        model_raw = model_raw.to(memory_format=torch.channels_last)
+    model = model_raw
+    if config.ENABLE_TORCH_COMPILE and hasattr(torch, "compile"):
+        model = torch.compile(model_raw)
+    return model_raw, model
+
+
+def make_loader(dataset, batch_size, shuffle, num_workers, drop_last=False):
+    kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": config.PIN_MEMORY,
+        "drop_last": drop_last,
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = config.PERSISTENT_WORKERS
+        kwargs["prefetch_factor"] = config.PREFETCH_FACTOR
+    return DataLoader(dataset, **kwargs)
+
+
+def build_optimizer(model_raw):
+    return torch.optim.AdamW(
+        model_raw.parameters(),
+        lr=config.LR,
+        weight_decay=config.WEIGHT_DECAY,
     )
 
-    # 优化 E + D + H_s + H_d
-    ae_params = (
-        list(model.encoder.parameters()) +
-        list(model.decoder.parameters()) +
-        list(model.struct_head.parameters()) +
-        list(model.detail_head.parameters())
-    )
-    optimizer = torch.optim.AdamW(ae_params, lr=config.S1_LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.S1_EPOCHS, eta_min=1e-6
-    )
 
-    best_val_loss = float("inf")
-    for epoch in range(1, config.S1_EPOCHS + 1):
-        # --- 训练 ---
-        model.encoder.train()
-        model.decoder.train()
-        model.struct_head.train()
-        model.detail_head.train()
-        
-        train_loss_sum = 0.0
-        train_struct_sum = 0.0
-        train_detail_sum = 0.0
-        train_count = 0
+def build_scheduler(optimizer):
+    def lr_lambda(epoch):
+        if epoch < config.WARMUP_EPOCHS:
+            return float(epoch + 1) / float(max(1, config.WARMUP_EPOCHS))
+        progress = (epoch - config.WARMUP_EPOCHS + 1) / float(max(1, config.EPOCHS - config.WARMUP_EPOCHS))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-        pbar = tqdm(dl_train, desc=f"[S1] Epoch {epoch}/{config.S1_EPOCHS} train")
-        for batch in pbar:
-            x = batch.to(device)
-            
-            # 生成 X_low 和 X_detail_target
-            with torch.no_grad():
-                x_low = blur(x)
-                x_detail_target = x - x_low
-            
-            # 前向
-            x_recon, z, x_struct_pred, x_detail_pred = model.forward_stage1(x)
-            
-            # 损失
-            loss, loss_dict = criterion(
-                x, x_recon, x_low, x_struct_pred, x_detail_target, x_detail_pred
-            )
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(ae_params, max_norm=1.0)
-            optimizer.step()
+def forward_loss(model, criterion, x, masks):
+    pred_patches = model(x, masks)
+    pred_img = model.unpatchify(pred_patches)
+    pixel_mask = patch_mask_to_pixel_mask(masks, img_size=config.IMG_SIZE, patch_size=config.PATCH_SIZE)
+    loss, loss_dict = criterion(x, pred_img, pixel_mask)
+    return loss, loss_dict
 
-            train_loss_sum += loss_dict["total"] * x.size(0)
-            train_struct_sum += loss_dict["struct"] * x.size(0)
-            train_detail_sum += loss_dict["detail"] * x.size(0)
-            train_count += x.size(0)
-            pbar.set_postfix(
-                loss=f"{loss_dict['total']:.4f}",
-                struct=f"{loss_dict['struct']:.4f}",
-                detail=f"{loss_dict['detail']:.4f}",
-            )
 
-        scheduler.step()
-        train_avg = train_loss_sum / train_count
-        train_struct_avg = train_struct_sum / train_count
-        train_detail_avg = train_detail_sum / train_count
-
-        # --- 验证 ---
-        model.encoder.eval()
-        model.decoder.eval()
-        model.struct_head.eval()
-        model.detail_head.eval()
-        
-        val_loss_sum = 0.0
-        val_count = 0
-
-        with torch.no_grad():
-            for batch in tqdm(dl_val, desc=f"[S1] Epoch {epoch}/{config.S1_EPOCHS} val"):
-                x = batch.to(device)
-                x_low = blur(x)
-                x_detail_target = x - x_low
-                x_recon, z, x_struct_pred, x_detail_pred = model.forward_stage1(x)
-                loss, loss_dict = criterion(
-                    x, x_recon, x_low, x_struct_pred, x_detail_target, x_detail_pred
+def validate_panel(model, criterion, dl_val, device):
+    panel_losses = []
+    panel_details = []
+    model.eval()
+    with torch.no_grad():
+        for mask_type, mask_ratio in config.VAL_PANEL:
+            loss_sum = 0.0
+            raw_sum = 0.0
+            lap_sum = 0.0
+            count = 0
+            for batch in tqdm(dl_val, desc=f"val {mask_type}_{int(mask_ratio * 100)}%", leave=False):
+                x = move_to_device(batch, device)
+                masks, _ = batch_sample_masks(
+                    batch_size=x.shape[0],
+                    grid_size=config.GRID_SIZE,
+                    mask_ratio=mask_ratio,
+                    mask_type=mask_type,
+                    device=device,
                 )
-                val_loss_sum += loss_dict["total"] * x.size(0)
-                val_count += x.size(0)
-
-        val_avg = val_loss_sum / val_count
-
-        msg = (f"[S1] Epoch {epoch}/{config.S1_EPOCHS} | "
-               f"train: total={train_avg:.6f} struct={train_struct_avg:.6f} detail={train_detail_avg:.6f} | "
-               f"val_loss={val_avg:.6f} | lr={scheduler.get_last_lr()[0]:.2e}")
-        log(msg, log_file)
-
-        # 保存最优
-        if val_avg < best_val_loss:
-            best_val_loss = val_avg
-            torch.save({
-                "epoch": epoch,
-                "encoder": model.encoder.state_dict(),
-                "decoder": model.decoder.state_dict(),
-                "struct_head": model.struct_head.state_dict(),
-                "detail_head": model.detail_head.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "val_loss": val_avg,
-            }, os.path.join(exp_dir, "best_ae.pth"))
-            log(f"  -> 保存最优 AE (val_loss={val_avg:.6f})", log_file)
-
-        # 定期保存 checkpoint
-        if epoch % 20 == 0:
-            torch.save({
-                "epoch": epoch,
-                "encoder": model.encoder.state_dict(),
-                "decoder": model.decoder.state_dict(),
-                "struct_head": model.struct_head.state_dict(),
-                "detail_head": model.detail_head.state_dict(),
-                "predictor": model.predictor.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "val_loss": val_avg,
-            }, os.path.join(exp_dir, "checkpoint.pth"))
-
-    log(f"[阶段一完成] 最优 val_loss={best_val_loss:.6f}", log_file)
+                loss, loss_dict = forward_loss(model, criterion, x, masks)
+                bsz = x.shape[0]
+                loss_sum += loss_dict["total"] * bsz
+                raw_sum += loss_dict["raw"] * bsz
+                lap_sum += loss_dict["lap"] * bsz
+                count += bsz
+            avg_total = loss_sum / max(1, count)
+            avg_raw = raw_sum / max(1, count)
+            avg_lap = lap_sum / max(1, count)
+            panel_losses.append(avg_total)
+            panel_details.append({
+                "mask_type": mask_type,
+                "mask_ratio": mask_ratio,
+                "loss": avg_total,
+                "raw": avg_raw,
+                "lap": avg_lap,
+            })
+    val_avg = float(np.mean(panel_losses)) if panel_losses else float("inf")
+    return val_avg, panel_details
 
 
-# ============================================================
-#  阶段二: Masked Latent Completion (只训练 P)
-# ============================================================
+def train(args):
+    set_seed(config.SEED)
+    configure_backend()
 
-def train_stage2(args):
     exp_dir = os.path.join(config.EXP_DIR, args.exp_name)
     os.makedirs(exp_dir, exist_ok=True)
     log_file = os.path.join(exp_dir, "train_log.txt")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    setup_cuda_optimizations()
-    log(f"[阶段二] 设备: {device}, batch_size={config.S2_BATCH_SIZE}", log_file)
+    log(f"设备: {device}", log_file)
+    if torch.cuda.is_available():
+        log(f"GPU: {torch.cuda.get_device_name(0)}", log_file)
 
-    # 数据 (RAM 预加载 + 优化 DataLoader)
-    log("预加载图像到 RAM...", log_file)
-    ds_train = RealPatchDataset(patches_per_image=8, split="train", preload=True, num_threads=16)
-    ds_val = RealPatchDataset(split="val", preload=True, num_threads=16)
-    dl_train = get_dataloader(ds_train, config.S2_BATCH_SIZE, shuffle=True, num_workers=config.S2_NUM_WORKERS)
-    dl_val = get_dataloader(ds_val, config.S2_BATCH_SIZE, shuffle=False, num_workers=config.S2_NUM_WORKERS)
-    log(f"训练集: {len(ds_train)} patches, 验证集: {len(ds_val)} patches", log_file)
-    log(f"DataLoader: workers={config.S2_NUM_WORKERS}, prefetch={getattr(config, 'PREFETCH_FACTOR', 2)}", log_file)
-
-    # 模型: 加载阶段一权重
-    model = LatentMAE(latent_channels=config.LATENT_CHANNELS).to(device)
-
-    ae_ckpt_path = args.ae_ckpt
-    if ae_ckpt_path is None:
-        ae_ckpt_path = os.path.join(exp_dir, "best_ae.pth")
-    if not os.path.exists(ae_ckpt_path):
-        raise FileNotFoundError(f"找不到阶段一权重: {ae_ckpt_path}")
-
-    ckpt = torch.load(ae_ckpt_path, map_location=device, weights_only=True)
-    model.encoder.load_state_dict(ckpt["encoder"])
-    model.decoder.load_state_dict(ckpt["decoder"])
-    # 加载辅助头 (如果存在)
-    if "struct_head" in ckpt:
-        model.struct_head.load_state_dict(ckpt["struct_head"])
-    if "detail_head" in ckpt:
-        model.detail_head.load_state_dict(ckpt["detail_head"])
-    log(f"加载 AE 权重: {ae_ckpt_path} (epoch={ckpt['epoch']})", log_file)
-
-    # 冻结 E 和 D (含辅助头)
-    model.freeze_ae()
-    log("已冻结 Encoder, Decoder 和辅助头", log_file)
-
-    # 损失 (分通道)
-    criterion = Stage2Loss(
-        struct_channels=config.STRUCT_CHANNELS,
-        lambda_struct=config.S2_LAMBDA_STRUCT,
-        struct_l1_weight=config.S2_STRUCT_L1_WEIGHT,
-        struct_cos_weight=config.S2_STRUCT_COS_WEIGHT,
-        lambda_detail=config.S2_LAMBDA_DETAIL,
-        detail_l1_weight=config.S2_DETAIL_L1_WEIGHT,
-        detail_cos_weight=config.S2_DETAIL_COS_WEIGHT,
+    ds_train = RealPatchDataset(split="train")
+    ds_val = RealPatchDataset(split="val", patches_per_image=1)
+    dl_train = make_loader(
+        ds_train,
+        config.TRAIN_BATCH_SIZE,
+        shuffle=True,
+        num_workers=config.TRAIN_NUM_WORKERS,
+        drop_last=True,
+    )
+    dl_val = make_loader(
+        ds_val,
+        config.VAL_BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.VAL_NUM_WORKERS,
+        drop_last=False,
     )
 
-    # 只优化 P
-    optimizer = torch.optim.AdamW(
-        model.predictor.parameters(), lr=config.S2_LR, weight_decay=1e-4
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.S2_EPOCHS, eta_min=1e-6
+    log(f"训练集原图: {len(ds_train.paths)}", log_file)
+    log(f"训练集 patch 数: {len(ds_train)}", log_file)
+    log(f"验证集原图: {len(ds_val.paths)}", log_file)
+    log(
+        f"batch={config.TRAIN_BATCH_SIZE}, train_workers={config.TRAIN_NUM_WORKERS}, "
+        f"val_workers={config.VAL_NUM_WORKERS}, channels_last={config.USE_CHANNELS_LAST}, "
+        f"compile={config.ENABLE_TORCH_COMPILE}",
+        log_file,
     )
 
-    best_val_loss = float("inf")
-    grid_size = config.LATENT_SPATIAL
+    model_raw, model = build_model(device)
+    criterion = PixelReconstructionLoss(
+        lambda_raw=config.LAMBDA_RAW,
+        lambda_lap=config.LAMBDA_LAP,
+    )
+    optimizer = build_optimizer(model_raw)
+    scheduler = build_scheduler(optimizer)
 
-    for epoch in range(1, config.S2_EPOCHS + 1):
-        # --- 训练 ---
-        model.predictor.train()
-        train_loss_sum = 0.0
-        train_struct_sum = 0.0
-        train_detail_sum = 0.0
+    start_epoch = 1
+    best_val = float("inf")
+    if args.resume is not None and os.path.exists(args.resume):
+        ckpt = torch.load(args.resume, map_location=device)
+        model_raw.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_val = ckpt.get("best_val", best_val)
+        log(f"恢复训练: {args.resume} @ epoch {ckpt['epoch']}", log_file)
+
+    for epoch in range(start_epoch, config.EPOCHS + 1):
+        model.train()
+        train_total = 0.0
+        train_raw = 0.0
+        train_lap = 0.0
         train_count = 0
+        ratio_meter = []
 
-        pbar = tqdm(dl_train, desc=f"[S2] Epoch {epoch}/{config.S2_EPOCHS} train")
+        pbar = tqdm(dl_train, desc=f"Epoch {epoch}/{config.EPOCHS}")
         for batch in pbar:
-            x = batch.to(device)
-            B = x.size(0)
+            x = move_to_device(batch, device)
+            masks, meta = batch_sample_train_masks(x.shape[0], config.GRID_SIZE, device)
+            loss, loss_dict = forward_loss(model, criterion, x, masks)
 
-            # 为 batch 中每个样本独立采样 mask
-            masks = []
-            for _ in range(B):
-                m, _, _ = sample_train_mask(grid_size)
-                masks.append(m)
-            masks = torch.stack(masks).to(device)  # [B, N]
-
-            z, z_hat = model.forward_stage2(x, masks)
-            loss, loss_dict = criterion(z, z_hat, masks)
-
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.predictor.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model_raw.parameters(), max_norm=config.GRAD_CLIP)
             optimizer.step()
 
-            train_loss_sum += loss_dict["total"] * B
-            train_struct_sum += loss_dict["struct"] * B
-            train_detail_sum += loss_dict["detail"] * B
-            train_count += B
+            bsz = x.shape[0]
+            train_total += loss_dict["total"] * bsz
+            train_raw += loss_dict["raw"] * bsz
+            train_lap += loss_dict["lap"] * bsz
+            train_count += bsz
+            ratio_meter.extend([m["actual_ratio"] for m in meta])
             pbar.set_postfix(
-                loss=f"{loss_dict['total']:.4f}",
-                struct=f"{loss_dict['struct']:.4f}",
-                detail=f"{loss_dict['detail']:.4f}",
+                total=f"{loss_dict['total']:.4f}",
+                raw=f"{loss_dict['raw']:.4f}",
+                lap=f"{loss_dict['lap']:.4f}",
             )
 
         scheduler.step()
-        train_avg = train_loss_sum / train_count
-        train_struct_avg = train_struct_sum / train_count
-        train_detail_avg = train_detail_sum / train_count
+        train_avg = train_total / max(1, train_count)
+        train_raw_avg = train_raw / max(1, train_count)
+        train_lap_avg = train_lap / max(1, train_count)
+        train_ratio_avg = float(np.mean(ratio_meter)) if ratio_meter else 0.0
 
-        # --- 验证: 多条件面板平均 ---
-        model.predictor.eval()
-        val_panel = [
-            (0.40, "random"),
-            (0.60, "random"),
-            (0.75, "random"),
-            (0.60, "block"),
-        ]
-        panel_losses = []
-
-        with torch.no_grad():
-            for p_ratio, p_type in val_panel:
-                vl_sum = 0.0
-                vl_count = 0
-                for batch in tqdm(dl_val, desc=f"  val {p_type}_{int(p_ratio*100)}%", leave=False):
-                    x = batch.to(device)
-                    B = x.size(0)
-                    masks = torch.stack([
-                        sample_mask(grid_size, p_ratio, p_type)[0] for _ in range(B)
-                    ]).to(device)
-
-                    z, z_hat = model.forward_stage2(x, masks)
-                    loss, loss_dict = criterion(z, z_hat, masks)
-                    vl_sum += loss_dict["total"] * B
-                    vl_count += B
-                panel_losses.append(vl_sum / vl_count)
-
-        val_avg = sum(panel_losses) / len(panel_losses)
+        val_avg, panel_details = validate_panel(model, criterion, dl_val, device)
         panel_str = " | ".join(
-            f"{t}_{int(r*100)}%={l:.6f}" for (r, t), l in zip(val_panel, panel_losses)
+            f"{item['mask_type']}_{int(item['mask_ratio'] * 100)}%={item['loss']:.5f}"
+            for item in panel_details
         )
-
-        msg = (f"[S2] Epoch {epoch}/{config.S2_EPOCHS} | "
-               f"train: total={train_avg:.6f} struct={train_struct_avg:.6f} detail={train_detail_avg:.6f} | "
-               f"val_avg={val_avg:.6f} [{panel_str}] | "
-               f"lr={scheduler.get_last_lr()[0]:.2e}")
+        msg = (
+            f"Epoch {epoch}/{config.EPOCHS} | "
+            f"train_total={train_avg:.6f} raw={train_raw_avg:.6f} lap={train_lap_avg:.6f} "
+            f"mask={train_ratio_avg:.4f} | "
+            f"val_avg={val_avg:.6f} | {panel_str} | "
+            f"lr={scheduler.get_last_lr()[0]:.2e}"
+        )
         log(msg, log_file)
 
-        # 保存最优
-        if val_avg < best_val_loss:
-            best_val_loss = val_avg
-            torch.save({
-                "epoch": epoch,
-                "predictor": model.predictor.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "val_loss": val_avg,
-            }, os.path.join(exp_dir, "best_predictor.pth"))
-            log(f"  -> 保存最优 Predictor (val_loss={val_avg:.6f})", log_file)
+        state = {
+            "epoch": epoch,
+            "model": model_raw.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "best_val": best_val,
+            "val_avg": val_avg,
+            "panel": panel_details,
+            "config": {k: v for k, v in config.__dict__.items() if k.isupper()},
+        }
+        torch.save(state, os.path.join(exp_dir, "last_model.pth"))
 
-        # 定期 checkpoint
+        if val_avg < best_val:
+            best_val = val_avg
+            state["best_val"] = best_val
+            torch.save(state, os.path.join(exp_dir, "best_model.pth"))
+            log(f"保存最优模型: val_avg={val_avg:.6f}", log_file)
+
         if epoch % 20 == 0:
-            torch.save({
-                "epoch": epoch,
-                "predictor": model.predictor.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "val_loss": val_avg,
-            }, os.path.join(exp_dir, "checkpoint_s2.pth"))
+            torch.save(state, os.path.join(exp_dir, f"checkpoint_epoch_{epoch}.pth"))
 
-    log(f"[阶段二完成] 最优 val_loss={best_val_loss:.6f}", log_file)
+    summary = {
+        "best_val": best_val,
+        "epochs": config.EPOCHS,
+        "exp_name": args.exp_name,
+    }
+    with open(os.path.join(exp_dir, "train_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    log(f"训练完成: best_val={best_val:.6f}", log_file)
 
-
-# ============================================================
-#  入口
-# ============================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Latent MAE 训练")
-    parser.add_argument("--stage", type=int, required=True, choices=[1, 2],
-                        help="训练阶段: 1=AE预训练, 2=Masked Completion")
-    parser.add_argument("--exp_name", type=str, default="A0",
-                        help="实验名称, 用于创建输出目录")
-    parser.add_argument("--ae_ckpt", type=str, default=None,
-                        help="阶段二使用的 AE checkpoint 路径 (默认使用同目录下的 best_ae.pth)")
+    parser = argparse.ArgumentParser(description="实验三 Pixel-space MAE 训练 (5090版)")
+    parser.add_argument("--exp_name", type=str, default="Exp3_5090_A0")
+    parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
-
-    if args.stage == 1:
-        train_stage1(args)
-    else:
-        train_stage2(args)
+    train(args)
